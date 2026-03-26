@@ -138,7 +138,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
 }
 
 template <ggml_type type, int ncols_dst, bool has_fusion, bool is_multi_token_id = false>
-__launch_bounds__(calc_nwarps(ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+__launch_bounds__(calc_nwarps(ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)   // vx= (13824X5120) vy = (5120X1)
 static __global__ void mul_mat_vec_q(
         const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids, const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -147,21 +147,20 @@ static __global__ void mul_mat_vec_q(
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
         const uint32_t ids_stride) {
 
-    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
-    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;  // qk=256 defines the logical block size, meaning 256 weights of 4 bit each share a single scale factor
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi; // qi = 32 means that the 256 weights in a block are physically stored using 32 integers (32-bit each),
+    constexpr int vdr = get_vdr_mmvq(type);              // vdr = 2 means each thread performs a vectorized load of two 32-bit integers (64 bits total)
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(ncols_dst, table_id);
     constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);   //case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
 
-    const     int tid = warp_size*threadIdx.y + threadIdx.x;
-    const     int row0 = rows_per_cuda_block*blockIdx.x;
-    const     int blocks_per_row_x = ncols_x / qk;
-    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
-
+    const     int tid = warp_size*threadIdx.y + threadIdx.x;  //threadIdx.y = warp number inside the thread block. //0 to 127
+    const     int row0 = rows_per_cuda_block*blockIdx.x;     //  row0 = blockIdx.x;
+    const     int blocks_per_row_x = ncols_x / qk;     // blocks_per_row_x = 5120/256 = 20 logical blocks // number of logical blocks per row. Each block is of size qk (e.g. 256 weights) and has its own scale factor. //each block. = 2B+2B+12B+128B = 144B
+    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;  //blocks_per_iter = 8 // qi = 32 (32 integers (int32) per logical block), vdr=2 (each thread proccess 2 int32 = 64 bits), blocks_per_iter = 256/32 = 8 means 8 logical blocks can be processed by one thread block. since we have one block only for one row hence, 8 logical blocks in one iteration.
     const uint32_t channel_dst = blockIdx.y;
 
     uint32_t token_idx = 0;
@@ -229,23 +228,23 @@ static __global__ void mul_mat_vec_q(
                 }
             }
         }
-    }
+    } 
 
     // partial sum for each thread
     float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
-    float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
+    float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}}; // we can keep this in shared memory.
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     if constexpr (is_multi_token_id) {
         y += token_idx*stride_col_y;
     }
-    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;  //Moves the pointer down to the specific starting row (e.g., Row 50) of that matrix.
 
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {   // qi/vdr; 32/2 = 16 threads covers one logical block of 256 weights,. kbx telling the thread which specific QK=256 weight block it is responsible for.
+        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx. kby: {0,8, 16...}
 
         // x block quant index when casting the quants to int
-        const int kqs = vdr * (tid % (qi/vdr));
+        const int kqs = vdr * (tid % (qi/vdr));  // kqs : (0-30) inside that logical block starting position for the thread to load its 2 ints. 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30
 
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
@@ -263,7 +262,7 @@ static __global__ void mul_mat_vec_q(
         }
     }
 
-    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];  // 3*8*2*32 = 1152*4 = 4608 floats for ncols_dst=3, rows_per_cuda_block=2, nwarps=4. We can fit this in shared memory and it is faster than using global memory for the intermediate partial sums. Each warp writes to its own portion of shared memory to avoid bank conflicts.
     __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
     if constexpr (!has_fusion) {
         (void) tmp_shared_gate;
@@ -298,11 +297,11 @@ static __global__ void mul_mat_vec_q(
 
     // sum up partial sums and write back result
 #pragma unroll
-    for (int j = 0; j < ncols_dst; ++j) {
+    for (int j = 0; j < ncols_dst; ++j) {  //ncols_dst = 8
 #pragma unroll
-        for (int i = 0; i < rows_per_cuda_block; ++i) {
+        for (int i = 0; i < rows_per_cuda_block; ++i) {    // rows_per_cuda_block = 1 or 2.
 #pragma unroll
-            for (int l = 0; l < nwarps-1; ++l) {
+            for (int l = 0; l < nwarps-1; ++l) {     // nwarps = 2 or 4.
                 tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
                 if constexpr (has_fusion) {
                     if (use_gate) {

@@ -775,7 +775,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
-    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
+    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;    //exact memory location of that quant_block in matirx.
 
     int    v[2];
     int    u[2*QR4_K];
@@ -789,9 +789,9 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     // iqs = 8...11 -> bq8_offset = 4, want q4_offset = 64, 68, 72, 76
     // iqs = 12..15 -> bq8_offset = 6, want q4_offset = 96, 100, 104, 108
 
-    const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
-    v[0] = q4[0];
-    v[1] = q4[4];
+    const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));  //q4_base = 16*(2g) + 4*s = 32g + 4s
+    v[0] = q4[0];   //32g + 0,4,8,12    //group 0 -> qs[  0.. 31] each thread in group read 16B apart 4bytes.
+    v[1] = q4[4];   //32g + 16,20,24,28
 
     const uint16_t * scales = (const uint16_t *)bq4_K->scales;
     uint16_t aux[2];
@@ -805,14 +805,14 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     }
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
-
+// add pragrma here.
     for (int i = 0; i < QR4_K; ++i) {
         const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
         d8[i] = __low2float(bq8i->ds);
 
-        const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
-        u[2*i+0] = q8[0];
-        u[2*i+1] = q8[4];
+        const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);     //(int*)bq8i->qs + s : s = {0,1,2,3}
+        u[2*i+0] = q8[0];   //u[...] = q8[0] reads bytes [4s ... 4s+3]
+        u[2*i+1] = q8[4];  //u[...] = q8[4] reads bytes [16+4s ... 19+4s]
     }
 
     return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
