@@ -240,22 +240,117 @@ static __global__ void mul_mat_vec_q(
     }
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;  //Moves the pointer down to the specific starting row (e.g., Row 50) of that matrix.
 
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {   // qi/vdr; 32/2 = 16 threads covers one logical block of 256 weights,. kbx telling the thread which specific QK=256 weight block it is responsible for.
-        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx. kby: {0,8, 16...}
+//     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {   // qi/vdr; 32/2 = 16 threads covers one logical block of 256 weights,. kbx telling the thread which specific QK=256 weight block it is responsible for.
+//         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx. kby: {0,8, 16...}
 
-        // x block quant index when casting the quants to int
-        const int kqs = vdr * (tid % (qi/vdr));  // kqs : (0-30) inside that logical block starting position for the thread to load its 2 ints. 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30
+//         // x block quant index when casting the quants to int
+//         const int kqs = vdr * (tid % (qi/vdr));  // kqs : (0-30) inside that logical block starting position for the thread to load its 2 ints. 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30
 
-#pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
-#pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                if constexpr (has_fusion) {
-                    if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+// #pragma unroll
+//         for (int j = 0; j < ncols_dst; ++j) {
+// #pragma unroll
+//             for (int i = 0; i < rows_per_cuda_block; ++i) {
+//                 tmp[j][i] += vec_dot_q_cuda(
+//                     vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+//                 if constexpr (has_fusion) {
+//                     if (use_gate) {
+//                         tmp_gate[j][i] += vec_dot_q_cuda(
+//                             vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+//                     }
+//                 }
+//             }
+//         }
+//     }
+
+    static_assert(sizeof(block_q8_1) % sizeof(int) == 0, "block_q8_1 must be int-copyable");
+    constexpr int q8_blocks_per_kbx = qk / QK8_1;          // Q4_K -> 256 / 32 = 8
+    constexpr int lanes_per_kbx     = qi / vdr;            // Q4_K -> 32 / 2 = 16
+    constexpr int kbx_per_warp      = warp_size / lanes_per_kbx; // Q4_K -> 32 / 16 = 2
+    constexpr int ints_per_q8_block = sizeof(block_q8_1) / sizeof(int); // 36 / 4 = 9
+    constexpr int q8_blocks_per_warp = kbx_per_warp * q8_blocks_per_kbx; // Q4_K -> 16
+
+    __shared__ block_q8_1 q8_stage[(type == GGML_TYPE_Q4_K) ? (nwarps * q8_blocks_per_warp) : 1 ];
+
+        if constexpr (type == GGML_TYPE_Q4_K) {
+        const int lane = threadIdx.x;
+        const int warp = threadIdx.y;
+
+        const int kbx_in_warp = lane / lanes_per_kbx;   // 0 or 1 for Q4_K
+        const int kqs         = vdr * (lane % lanes_per_kbx);
+
+        block_q8_1 * warp_q8_stage =
+            q8_stage + warp * q8_blocks_per_warp;
+
+        int * warp_q8_stage_i = reinterpret_cast<int *>(warp_q8_stage);
+
+        // Each warp owns kbx_per_warp consecutive kbx values per iteration
+        for (int warp_kbx0 = warp * kbx_per_warp;
+            warp_kbx0 < blocks_per_row_x;
+            warp_kbx0 += blocks_per_iter) {
+
+            const int valid_kbx = min(kbx_per_warp, blocks_per_row_x - warp_kbx0);
+            const int ints_to_copy = valid_kbx * q8_blocks_per_kbx * ints_per_q8_block;
+
+        #pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const block_q8_1 * y_src =
+                        &y[j * stride_col_y + warp_kbx0 * q8_blocks_per_kbx];
+
+                    const int * y_src_i = reinterpret_cast<const int *>(y_src);
+
+                    // Warp-cooperative contiguous copy from global memory -> shared memory
+                    for (int t = lane; t < ints_to_copy; t += warp_size) {
+                        warp_q8_stage_i[t] = y_src_i[t];
+                    }
+
+                    __syncwarp();
+
+                    if (kbx_in_warp < valid_kbx) {
+                        const int local_kbx = warp_kbx0 + kbx_in_warp;
+                        const block_q8_1 * y_tile =
+                            warp_q8_stage + kbx_in_warp * q8_blocks_per_kbx;
+
+        #pragma unroll
+                        for (int i = 0; i < rows_per_cuda_block; ++i) {
+                            tmp[j][i] += vec_dot_q4_K_q8_1(
+                                vx,
+                                y_tile,
+                                kbx_offset + i * stride_row_x + local_kbx,
+                                kqs);
+
+                            if constexpr (has_fusion) {
+                                if (use_gate) {
+                                    tmp_gate[j][i] += vec_dot_q4_K_q8_1(
+                                        vgate,
+                                        y_tile,
+                                        kbx_offset + i * stride_row_x + local_kbx,
+                                        kqs);
+                                }
+                            }
+                        }
+                    }
+
+                    __syncwarp();
+                }
+            }
+    } else {
+        for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1);
+
+            // x block quant index when casting the quants to int
+            const int kqs = vdr * (tid % (qi/vdr));
+
+    #pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+    #pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp[j][i] += vec_dot_q_cuda(
+                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_gate[j][i] += vec_dot_q_cuda(
+                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        }
                     }
                 }
             }
