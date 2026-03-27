@@ -818,6 +818,73 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
 }
 
+static __device__ __forceinline__ float vec_dot_q4_K_q8_1_packed_smem(
+    const void * __restrict__ vbq,
+    const uint32_t * __restrict__ ds_pack,
+    const int * __restrict__ qlo_pack,
+    const int * __restrict__ qhi_pack,
+    const int & kbx,
+    const int & iqs,
+    const int & kbx_in_warp) {
+
+    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
+
+    int    v[2];
+    int    u[2*QR4_K];
+    float d8[QR4_K];
+
+    // iqs is 0,2,4,...,30
+    // subgroup inside a kbx:
+    //   g = 0..3
+    //   s = 0..3
+    const int g = iqs >> 3;           // (iqs/2) / 4
+    const int s = (iqs >> 1) & 0x3;   // (iqs/2) % 4
+
+    // q4 side stays exactly the same logically
+    // original bq8_offset = 2 * g
+    const int * q4 = (const int *)(bq4_K->qs + 32 * g + 4 * s);
+    v[0] = q4[0];
+    v[1] = q4[4];
+
+    // original j = bq8_offset / 2 = g
+    const uint16_t * scales = (const uint16_t *) bq4_K->scales;
+    uint16_t aux[2];
+    if (g < 2) {
+        aux[0] = scales[g+0] & 0x3f3f;
+        aux[1] = scales[g+2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[g+2] >> 0) & 0x0f0f) | ((scales[g-2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[g+2] >> 4) & 0x0f0f) | ((scales[g-0] & 0xc0c0) >> 2);
+    }
+    const uint8_t * sc = (const uint8_t *) aux;
+    const uint8_t * m  = sc + 2;
+
+    // packed layout for one warp:
+    //
+    // ds_pack : [pair][kbx_in_warp][g]                 -> 2 * 2 * 4 = 16 uint32_t
+    // qlo_pack: [pair][kbx_in_warp][g][s]             -> 2 * 2 * 4 * 4 = 64 ints
+    // qhi_pack: [pair][kbx_in_warp][g][s]             -> 2 * 2 * 4 * 4 = 64 ints
+    //
+    // flattened indices:
+    // ds : pair*8  + kbx_in_warp*4 + g
+    // q  : pair*32 + kbx_in_warp*16 + g*4 + s
+
+    const int ds_idx0 = 0 * 8  + kbx_in_warp * 4 + g;
+    const int ds_idx1 = 1 * 8  + kbx_in_warp * 4 + g;
+    const int q_idx0  = 0 * 32 + kbx_in_warp * 16 + g * 4 + s;
+    const int q_idx1  = 1 * 32 + kbx_in_warp * 16 + g * 4 + s;
+
+    d8[0] = __low2float(*reinterpret_cast<const ggml_half2 *>(&ds_pack[ds_idx0]));
+    d8[1] = __low2float(*reinterpret_cast<const ggml_half2 *>(&ds_pack[ds_idx1]));
+
+    u[0] = qlo_pack[q_idx0];
+    u[1] = qhi_pack[q_idx0];
+    u[2] = qlo_pack[q_idx1];
+    u[3] = qhi_pack[q_idx1];
+
+    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
+}
+
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 

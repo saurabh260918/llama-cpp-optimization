@@ -262,77 +262,138 @@ static __global__ void mul_mat_vec_q(
 //         }
 //     }
 
-    static_assert(sizeof(block_q8_1) % sizeof(int) == 0, "block_q8_1 must be int-copyable");
-    constexpr int q8_blocks_per_kbx = qk / QK8_1;          // Q4_K -> 256 / 32 = 8
-    constexpr int lanes_per_kbx     = qi / vdr;            // Q4_K -> 32 / 2 = 16
-    constexpr int kbx_per_warp      = warp_size / lanes_per_kbx; // Q4_K -> 32 / 16 = 2
-    constexpr int ints_per_q8_block = sizeof(block_q8_1) / sizeof(int); // 36 / 4 = 9
-    constexpr int q8_blocks_per_warp = kbx_per_warp * q8_blocks_per_kbx; // Q4_K -> 16
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        static_assert(sizeof(block_q8_1) == 9 * sizeof(int), "unexpected block_q8_1 size");
 
-    __shared__ block_q8_1 q8_stage[(type == GGML_TYPE_Q4_K) ? (nwarps * q8_blocks_per_warp) : 1 ];
+        constexpr int q8_blocks_per_kbx  = qk / QK8_1;                  // 8
+        constexpr int lanes_per_kbx      = qi / vdr;                    // 16
+        constexpr int kbx_per_warp       = warp_size / lanes_per_kbx;   // 2
+        constexpr int ints_per_q8_block  = sizeof(block_q8_1) / sizeof(int); // 9
+        constexpr int q8_blocks_per_warp = kbx_per_warp * q8_blocks_per_kbx;  // 16
+        constexpr int ints_per_warp_tile = q8_blocks_per_warp * ints_per_q8_block; // 144
 
-        if constexpr (type == GGML_TYPE_Q4_K) {
+        // per-warp staging buffers
+        __shared__ int      q8_raw   [nwarps][ints_per_warp_tile];
+        __shared__ uint32_t ds_pack  [nwarps][16];   // [pair][kbx_in_warp][g] = 2*2*4
+        __shared__ int      qlo_pack [nwarps][64];   // [pair][kbx_in_warp][g][s] = 2*2*4*4
+        __shared__ int      qhi_pack [nwarps][64];
+
         const int lane = threadIdx.x;
         const int warp = threadIdx.y;
 
-        const int kbx_in_warp = lane / lanes_per_kbx;   // 0 or 1 for Q4_K
+        const int kbx_in_warp = lane / lanes_per_kbx;   // 0 or 1
         const int kqs         = vdr * (lane % lanes_per_kbx);
 
-        block_q8_1 * warp_q8_stage =
-            q8_stage + warp * q8_blocks_per_warp;
+        int *      warp_raw  = q8_raw[warp];
+        uint32_t * warp_ds   = ds_pack[warp];
+        int *      warp_qlo  = qlo_pack[warp];
+        int *      warp_qhi  = qhi_pack[warp];
 
-        int * warp_q8_stage_i = reinterpret_cast<int *>(warp_q8_stage);
-
-        // Each warp owns kbx_per_warp consecutive kbx values per iteration
+        // Each warp owns 2 consecutive kbx values per iteration
         for (int warp_kbx0 = warp * kbx_per_warp;
             warp_kbx0 < blocks_per_row_x;
             warp_kbx0 += blocks_per_iter) {
 
-            const int valid_kbx = min(kbx_per_warp, blocks_per_row_x - warp_kbx0);
+            const int valid_kbx    = min(kbx_per_warp, blocks_per_row_x - warp_kbx0);
             const int ints_to_copy = valid_kbx * q8_blocks_per_kbx * ints_per_q8_block;
 
-        #pragma unroll
-                for (int j = 0; j < ncols_dst; ++j) {
-                    const block_q8_1 * y_src =
-                        &y[j * stride_col_y + warp_kbx0 * q8_blocks_per_kbx];
+    #pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const block_q8_1 * y_src =
+                    &y[j * stride_col_y + warp_kbx0 * q8_blocks_per_kbx];
+                const int * y_src_i = reinterpret_cast<const int *>(y_src);
 
-                    const int * y_src_i = reinterpret_cast<const int *>(y_src);
+                // ------------------------------------------------------------
+                // Stage 1: coalesced raw copy from global memory -> shared memory
+                // ------------------------------------------------------------
+                for (int t = lane; t < ints_to_copy; t += warp_size) {
+                    warp_raw[t] = y_src_i[t];
+                }
 
-                    // Warp-cooperative contiguous copy from global memory -> shared memory
-                    for (int t = lane; t < ints_to_copy; t += warp_size) {
-                        warp_q8_stage_i[t] = y_src_i[t];
+                __syncwarp();
+
+                // ------------------------------------------------------------
+                // Stage 2: repack inside shared memory
+                //
+                // Goal:
+                // - keep the packed compute layout unchanged
+                // - change only the WRITE pattern into qlo/qhi packs
+                // - use all 32 lanes and write in packed order
+                //
+                // packed layout remains:
+                //   ds : pair*8  + kbx_in_warp*4 + g
+                //   q  : pair*32 + kbx_in_warp*16 + g*4 + s
+                //
+                // For qlo/qhi, lane t writes directly to packed index:
+                //   q_idx = pair*32 + t
+                //
+                // This makes the destination addresses contiguous across the warp
+                // for each pair, which removes the previous shared-store bank pattern.
+                // ------------------------------------------------------------
+                #pragma unroll
+                for (int p = 0; p < QR4_K; ++p) {
+                    // Full-warp packed-order writes for qlo/qhi
+                    const int k = lane >> 4;          // 0 or 1
+                    const int g = (lane & 15) >> 2;   // 0..3
+                    const int s = lane & 3;           // 0..3
+
+                    if (k < valid_kbx) {
+                        const int b     = k * q8_blocks_per_kbx + 2 * g + p; // raw q8 block index
+                        const int base  = 9 * b;
+                        const int q_idx = p * 32 + lane;                     // packed-order destination
+
+                        warp_qlo[q_idx] = warp_raw[base + 1 + s];
+                        warp_qhi[q_idx] = warp_raw[base + 5 + s];
                     }
 
-                    __syncwarp();
+                    // Small ds repack: only first valid_kbx*4 lanes participate
+                    if (lane < valid_kbx * 4) {
+                        const int k_ds   = lane >> 2;        // 0..valid_kbx-1
+                        const int g_ds   = lane & 3;         // 0..3
+                        const int b_ds   = k_ds * q8_blocks_per_kbx + 2 * g_ds + p;
+                        const int ds_idx = p * 8 + k_ds * 4 + g_ds;
 
-                    if (kbx_in_warp < valid_kbx) {
-                        const int local_kbx = warp_kbx0 + kbx_in_warp;
-                        const block_q8_1 * y_tile =
-                            warp_q8_stage + kbx_in_warp * q8_blocks_per_kbx;
+                        warp_ds[ds_idx] = static_cast<uint32_t>(warp_raw[9 * b_ds + 0]);
+                    }
+                }
 
-        #pragma unroll
-                        for (int i = 0; i < rows_per_cuda_block; ++i) {
-                            tmp[j][i] += vec_dot_q4_K_q8_1(
-                                vx,
-                                y_tile,
-                                kbx_offset + i * stride_row_x + local_kbx,
-                                kqs);
+                __syncwarp();
 
-                            if constexpr (has_fusion) {
-                                if (use_gate) {
-                                    tmp_gate[j][i] += vec_dot_q4_K_q8_1(
-                                        vgate,
-                                        y_tile,
-                                        kbx_offset + i * stride_row_x + local_kbx,
-                                        kqs);
-                                }
+                // ------------------------------------------------------------
+                // Compute using packed shared-memory q8 layout
+                // ------------------------------------------------------------
+                if (kbx_in_warp < valid_kbx) {
+                    const int local_kbx = warp_kbx0 + kbx_in_warp;
+
+    #pragma unroll
+                    for (int i = 0; i < rows_per_cuda_block; ++i) {
+                        tmp[j][i] += vec_dot_q4_K_q8_1_packed_smem(
+                            vx,
+                            warp_ds,
+                            warp_qlo,
+                            warp_qhi,
+                            kbx_offset + i * stride_row_x + local_kbx,
+                            kqs,
+                            kbx_in_warp);
+
+                        if constexpr (has_fusion) {
+                            if (use_gate) {
+                                tmp_gate[j][i] += vec_dot_q4_K_q8_1_packed_smem(
+                                    vgate,
+                                    warp_ds,
+                                    warp_qlo,
+                                    warp_qhi,
+                                    kbx_offset + i * stride_row_x + local_kbx,
+                                    kqs,
+                                    kbx_in_warp);
                             }
                         }
                     }
-
-                    __syncwarp();
                 }
+
+                __syncwarp();
             }
+        }
     } else {
         for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
             const int kby = kbx * (qk/QK8_1);
