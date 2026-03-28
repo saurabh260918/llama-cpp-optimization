@@ -873,6 +873,56 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_mmvq2(
     return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
 }
 
+static __device__ __forceinline__ void unpack_q4_K_sm6_mmvq2(
+        const uint8_t packed[3], uint8_t unpacked[4]) {
+    const uint32_t sm = uint32_t(packed[0])
+                      | (uint32_t(packed[1]) << 8)
+                      | (uint32_t(packed[2]) << 16);
+
+    unpacked[0] = sm & 0x3f;
+    unpacked[1] = (sm >>  6) & 0x3f;
+    unpacked[2] = (sm >> 12) & 0x3f;
+    unpacked[3] = (sm >> 18) & 0x3f;
+}
+
+static __device__ __forceinline__ float vec_dot_q4_K_mmvq2_q8_1_mmvq2(
+    const block_q4_K_mmvq2 * __restrict__ bq4_K,
+    const block_q8_1_mmvq2 * __restrict__ bq8_1,
+    const int & kbx,
+    const int & iqs) {
+
+    const block_q4_K_mmvq2 & tile_q4 = bq4_K[kbx >> 1];
+    const block_q8_1_mmvq2 & tile_q8 = bq8_1[kbx >> 1];
+
+    int    v[2];
+    int    u[2 * QR4_K];
+    float  d8[QR4_K];
+    uint8_t aux[2 * QR4_K];
+
+    const int k = kbx & 1;
+    const int g = (iqs >> 3);
+    const int s = (iqs >> 1) & 0x3;
+    const int lane_idx = k * 16 + g * 4 + s;
+
+    v[0] = tile_q4.qv0[lane_idx];
+    v[1] = tile_q4.qv1[lane_idx];
+
+    unpack_q4_K_sm6_mmvq2(tile_q4.sm6[k][g], aux);
+    const uint8_t * sc = aux;
+    const uint8_t * m  = aux + 2;
+
+    d8[0] = __low2float(*reinterpret_cast<const ggml_half2 *>(&tile_q8.ds[0][k][g]));
+    d8[1] = __low2float(*reinterpret_cast<const ggml_half2 *>(&tile_q8.ds[1][k][g]));
+
+    u[0] = tile_q8.qlo[0][lane_idx];
+    u[1] = tile_q8.qhi[0][lane_idx];
+    u[2] = tile_q8.qlo[1][lane_idx];
+    u[3] = tile_q8.qhi[1][lane_idx];
+
+    const half2 dm4 = reinterpret_cast<const half2 *>(tile_q4.dm)[k];
+    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, dm4, d8);
+}
+
 
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {

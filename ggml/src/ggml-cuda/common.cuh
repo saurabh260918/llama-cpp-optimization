@@ -1439,7 +1439,7 @@ struct ggml_cuda_mm_fusion_args_device {
     ggml_glu_op glu_op;
 };
 
-//added this new stuct to store the quantization parameters for q8_1 in the mmvq2 kernel to avoid having to load them from global memory multiple times
+// Packed q8_1 layout for the Q4_K MMVQ path.
 struct alignas(32) block_q8_1_mmvq2 {
     int qlo[2][32];      // pair p=0,1 ; lane-major
     int qhi[2][32];      // pair p=0,1 ; lane-major
@@ -1448,3 +1448,16 @@ struct alignas(32) block_q8_1_mmvq2 {
 
 static_assert(sizeof(block_q8_1_mmvq2) == 16*sizeof(block_q8_1),
               "wrong block_q8_1_mmvq2 size");
+
+// Packed Q4_K layout for the MMVQ path.
+// One tile = 2 consecutive Q4_K blocks = 512 weights.
+// Size matches raw storage exactly: 2 * sizeof(block_q4_K) = 288 B.
+struct alignas(32) block_q4_K_mmvq2 {
+    int      qv0[32];      // lane-major q4 word 0, lane = k*16 + g*4 + s
+    int      qv1[32];      // lane-major q4 word 1
+    uint8_t  sm6[2][4][3]; // k=0/1, g=0..3 ; packed {sc0, sc1, m0, m1} as 4x6 bits
+    uint32_t dm[2];        // raw ggml_half2 values for the 2 source blocks
+};
+
+static_assert(sizeof(block_q4_K_mmvq2) == 2*sizeof(block_q4_K),
+              "wrong block_q4_K_mmvq2 size");

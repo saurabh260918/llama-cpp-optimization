@@ -241,9 +241,20 @@ static __global__ void mul_mat_vec_q(
 
     const block_q8_1 * y = nullptr;
     const block_q8_1_mmvq2 * y2 = nullptr;
+    const block_q4_K_mmvq2 * x2 = nullptr;
+    const block_q4_K_mmvq2 * gate2 = nullptr;
 
     if constexpr (type == GGML_TYPE_Q4_K) {
+        // Restore note: packed q8 alone still leaves the original Q4_K decode
+        // path in the hot loop. Keep packed x and packed y row-based so both
+        // sides use the same local kbx -> tile access pattern.
+        x2 = ((const block_q4_K_mmvq2 *) vx) + sample_x*stride_sample_x + channel_x*stride_channel_x;
         y2 = ((const block_q8_1_mmvq2 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
+        if constexpr (has_fusion) {
+            if (use_gate) {
+                gate2 = ((const block_q4_K_mmvq2 *) vgate) + sample_x*stride_sample_x + channel_x*stride_channel_x;
+            }
+        }
         if constexpr (is_multi_token_id) {
             y2 += token_idx*stride_col_y;
         }
@@ -275,22 +286,13 @@ static __global__ void mul_mat_vec_q(
                 //     }
                 // }
                 if constexpr (type == GGML_TYPE_Q4_K) {
-                    const int tile_idx = kbx >> 1;
-                    if (tile_idx >= (int) stride_col_y) {
-                        asm("trap;");
-                    }
-                    const int kbx_q4 = kbx_offset + i*stride_row_x + kbx;
-                    // Restore note: the first packed-q8 version passed only
-                    // `kbx_q4` here. That made vec_dot_q4_K_q8_1_mmvq2() index
-                    // packed q8 with an absolute weight-block index even though
-                    // `y2` is row-based. Keep `kbx` local for the packed-q8 row.
-                    tmp[j][i] += vec_dot_q4_K_q8_1_mmvq2(
-                        vx, &y2[j * stride_col_y], kbx_q4, kbx, kqs);
+                    tmp[j][i] += vec_dot_q4_K_mmvq2_q8_1_mmvq2(
+                        &x2[(row0 + i) * stride_row_x], &y2[j * stride_col_y], kbx, kqs);
 
                     if constexpr (has_fusion) {
                         if (use_gate) {
-                            tmp_gate[j][i] += vec_dot_q4_K_q8_1_mmvq2(
-                                vgate, &y2[j * stride_col_y], kbx_q4, kbx, kqs);
+                            tmp_gate[j][i] += vec_dot_q4_K_mmvq2_q8_1_mmvq2(
+                                &gate2[(row0 + i) * stride_row_x], &y2[j * stride_col_y], kbx, kqs);
                         }
                     }
                 } else {
@@ -753,30 +755,10 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    if (src0->type == GGML_TYPE_Q4_K) {
-        const uintptr_t p = reinterpret_cast<uintptr_t>(src1_q8_1.get());
-        fprintf(stderr,
-                "MMVQ2 packed-q8 ptr=%p  alignof(block_q8_1_mmvq2)=%zu  mod16=%zu  mod32=%zu\n",
-                src1_q8_1.get(),
-                alignof(block_q8_1_mmvq2),
-                (size_t)(p % 16),
-                (size_t)(p % 32));
-    }
     {
-        // const int64_t s11 = src1->nb[1] / ts_src1;
-        // const int64_t s12 = src1->nb[2] / ts_src1;
-        // const int64_t s13 = src1->nb[3] / ts_src1;
-        // quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         const int64_t x_s11 = src1->nb[1] / ts_src1;
         const int64_t x_s12 = src1->nb[2] / ts_src1;
         const int64_t x_s13 = src1->nb[3] / ts_src1;
-
-        fprintf(stderr,
-                "MMVQ2 dispatch: ne10_padded=%lld x_s11=%lld x_s12=%lld x_s13=%lld\n",
-                (long long) ne10_padded,
-                (long long) x_s11,
-                (long long) x_s12,
-                (long long) x_s13);
 
         if (src0->type == GGML_TYPE_Q4_K) {
             quantize_row_q8_1_mmvq2_cuda(
@@ -791,16 +773,48 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 
-    const int64_t s01 = src0->nb[1] / ts_src0;
-    //const int64_t s11 = ne10_padded / QK8_1;
+    const int64_t s01_raw = src0->nb[1] / ts_src0;
+    const int64_t s02_raw = src0->nb[2] / ts_src0;
+    const int64_t s03_raw = src0->nb[3] / ts_src0;
+
+    const int64_t blocks_per_row_x = ne00 / QK_K;
+    const int64_t tiles_per_row_x = (blocks_per_row_x + 1) / 2;
+
+    ggml_cuda_pool_alloc<char> src0_q4_k_mmvq2(ctx.pool());
+    ggml_cuda_pool_alloc<char> gate_q4_k_mmvq2(ctx.pool());
+
+    const void * vx_mmvq = src0->data;
+    int64_t s01 = s01_raw;
+    int64_t s02 = s02_raw;
+    int64_t s03 = s03_raw;
+
+    if (src0->type == GGML_TYPE_Q4_K) {
+        const size_t nbytes_src0_q4_k_mmvq2 = ne03 * ne02 * ne01 * tiles_per_row_x * sizeof(block_q4_K_mmvq2);
+        src0_q4_k_mmvq2.alloc(ctx.pool(), nbytes_src0_q4_k_mmvq2);
+        repack_row_q4_K_mmvq2_cuda(
+            src0->data, src0_q4_k_mmvq2.get(),
+            ne00, s01_raw, s02_raw, s03_raw, ne01, ne02, ne03, stream);
+
+        vx_mmvq = src0_q4_k_mmvq2.get();
+        s01 = tiles_per_row_x;
+        s02 = ne01 * s01;
+        s03 = ne02 * s02;
+
+        if (fusion && fusion->gate) {
+            gate_q4_k_mmvq2.alloc(ctx.pool(), nbytes_src0_q4_k_mmvq2);
+            repack_row_q4_K_mmvq2_cuda(
+                fusion->gate->data, gate_q4_k_mmvq2.get(),
+                ne00, s01_raw, s02_raw, s03_raw, ne01, ne02, ne03, stream);
+            fusion_local.gate = gate_q4_k_mmvq2.get();
+        }
+    }
+
     // raw q8 path uses blocks of 32 values
     // packed q8 path uses tiles of 512 values (= 16 raw q8 blocks)
     const int64_t s11 = (src0->type == GGML_TYPE_Q4_K) ? (ne10_padded / (16 * QK8_1)) : (ne10_padded / QK8_1);
 
     const int64_t s1  =  dst->nb[1] / ts_dst;
-    const int64_t s02 = src0->nb[2] / ts_src0;
     const int64_t s2  =  dst->nb[2] / ts_dst;
-    const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
     const int64_t s12 = ne11*s11;
@@ -818,7 +832,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        vx_mmvq, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

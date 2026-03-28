@@ -377,6 +377,106 @@ void quantize_row_q8_1_mmvq2_cuda(
     // CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
+static __device__ __forceinline__ uint32_t pack_q4_K_sm6_values(
+        const uint8_t sc0, const uint8_t sc1, const uint8_t m0, const uint8_t m1) {
+    return (uint32_t(sc0) & 0x3fu)
+         | ((uint32_t(sc1) & 0x3fu) <<  6)
+         | ((uint32_t(m0)  & 0x3fu) << 12)
+         | ((uint32_t(m1)  & 0x3fu) << 18);
+}
+
+static __device__ __forceinline__ uint32_t pack_q4_K_sm6_group(const block_q4_K & src, const int g) {
+    const uint16_t * scales = reinterpret_cast<const uint16_t *>(src.scales);
+    uint16_t aux[2];
+
+    if (g < 2) {
+        aux[0] = scales[g + 0] & 0x3f3f;
+        aux[1] = scales[g + 2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[g + 2] >> 0) & 0x0f0f) | ((scales[g - 2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[g + 2] >> 4) & 0x0f0f) | ((scales[g - 0] & 0xc0c0) >> 2);
+    }
+
+    const uint8_t * sc = reinterpret_cast<const uint8_t *>(aux);
+    return pack_q4_K_sm6_values(sc[0], sc[1], sc[2], sc[3]);
+}
+
+static __global__ void repack_q4_K_mmvq2(
+        const block_q4_K * __restrict__ vx, block_q4_K_mmvq2 * __restrict__ vy,
+        const int64_t blocks_per_row,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne01, const uint3 ne02_fastdiv) {
+    const int lane = threadIdx.x;
+    const int64_t tile_in_row = blockIdx.x;
+    const int64_t i3 = fastdiv(blockIdx.z, ne02_fastdiv);
+    const int64_t i2 = blockIdx.z - i3 * ne02_fastdiv.z;
+    const int64_t i1 = blockIdx.y;
+    const int64_t tiles_per_row = (blocks_per_row + 1) / 2;
+
+    const int64_t row_group = i3 * ne02_fastdiv.z + i2;
+    const int64_t src_block0 = i3 * s03 + i2 * s02 + i1 * s01 + tile_in_row * 2;
+    const int64_t dst_tile = (row_group * ne01 + i1) * tiles_per_row + tile_in_row;
+
+    block_q4_K_mmvq2 * dst = vy + dst_tile;
+
+    const int k = lane >> 4;
+    const int g = (lane & 15) >> 2;
+    const int s = lane & 3;
+    const int64_t src_block = src_block0 + k;
+
+    if (src_block < i3 * s03 + i2 * s02 + i1 * s01 + blocks_per_row) {
+        const block_q4_K & src = vx[src_block];
+        const int * q4 = reinterpret_cast<const int *>(src.qs + 32 * g + 4 * s);
+        dst->qv0[lane] = q4[0];
+        dst->qv1[lane] = q4[4];
+    } else {
+        dst->qv0[lane] = 0;
+        dst->qv1[lane] = 0;
+    }
+
+    if (lane < 8) {
+        const int ks = lane >> 2;
+        const int gs = lane & 3;
+        const int64_t src_block_s = src_block0 + ks;
+        uint32_t packed = 0;
+        if (src_block_s < i3 * s03 + i2 * s02 + i1 * s01 + blocks_per_row) {
+            packed = pack_q4_K_sm6_group(vx[src_block_s], gs);
+        }
+        dst->sm6[ks][gs][0] = packed & 0xff;
+        dst->sm6[ks][gs][1] = (packed >> 8) & 0xff;
+        dst->sm6[ks][gs][2] = (packed >> 16) & 0xff;
+    }
+
+    if (lane < 2) {
+        const int64_t src_block_dm = src_block0 + lane;
+        dst->dm[lane] = 0;
+        if (src_block_dm < i3 * s03 + i2 * s02 + i1 * s01 + blocks_per_row) {
+            dst->dm[lane] = reinterpret_cast<const uint32_t *>(&vx[src_block_dm].dm)[0];
+        }
+    }
+}
+
+void repack_row_q4_K_mmvq2_cuda(
+        const void * vx, void * vy,
+        const int64_t ne00,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_K == 0);
+
+    const int64_t blocks_per_row = ne00 / QK_K;
+    const int64_t tiles_per_row = (blocks_per_row + 1) / 2;
+    const uint3 ne02_fastdiv = init_fastdiv_values(ne02);
+
+    const dim3 num_blocks(tiles_per_row, ne01, ne02 * ne03);
+    const dim3 block_size(WARP_SIZE, 1, 1);
+    repack_q4_K_mmvq2<<<num_blocks, block_size, 0, stream>>>(
+        reinterpret_cast<const block_q4_K *>(vx),
+        reinterpret_cast<block_q4_K_mmvq2 *>(vy),
+        blocks_per_row, s01, s02, s03, ne01, ne02_fastdiv);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 
 void quantize_mmq_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
