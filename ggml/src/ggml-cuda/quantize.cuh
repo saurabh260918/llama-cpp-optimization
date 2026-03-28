@@ -39,3 +39,12 @@ void quantize_mmq_mxfp4_cuda(const float *   x,
                              int64_t         ne2,
                              int64_t         ne3,
                              cudaStream_t    stream);
+//added this new function to quantize to q8_1 format for the mmvq2 kernel, which has a different quantization scheme than the original q8_1 format used in the original mmq kernel, so it needs a separate function to compute the quantization parameters and store them in the new block_q8_1_mmvq2 struct
+void quantize_row_q8_1_mmvq2_cuda(
+    const float * x, const int32_t * ids, void * vy,
+    const ggml_type type_src0,
+    const int64_t ne00,
+    const int64_t s01, const int64_t s02, const int64_t s03,
+    const int64_t ne0, const int64_t ne1,
+    const int64_t ne2, const int64_t ne3,
+    cudaStream_t stream);

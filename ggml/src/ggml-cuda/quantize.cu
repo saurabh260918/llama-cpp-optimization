@@ -286,6 +286,98 @@ void quantize_row_q8_1_cuda(
     GGML_UNUSED(type_src0);
 }
 
+static __global__ void pack_q8_1_mmvq2_inplace(
+    void * __restrict__ vy,
+    const int64_t ne0, const int64_t ne1,
+    const uint3 ne2_fastdiv) {
+
+    const int lane = threadIdx.x;
+
+    // one warp handles one packed tile
+    const int64_t tile_in_row = blockIdx.x;
+    const int64_t i3 = fastdiv(blockIdx.z, ne2_fastdiv);
+    const int64_t i2 = blockIdx.z - i3*ne2_fastdiv.z;
+    const int64_t i1 = blockIdx.y;
+
+    const int64_t raw_blocks_per_row = ne0 / QK8_1;         // ne0 / 32
+    const int64_t tiles_per_row      = ne0 / (16 * QK8_1);  // ne0 / 512
+
+    const int64_t row_idx = (i3 * ne2_fastdiv.z + i2) * ne1 + i1;
+    const int64_t raw_block0 = row_idx * raw_blocks_per_row + tile_in_row * 16;
+    const int64_t tile_idx   = row_idx * tiles_per_row      + tile_in_row;
+
+    const int * src_i = reinterpret_cast<const int *>((const block_q8_1 *) vy + raw_block0);
+    block_q8_1_mmvq2 * dst = reinterpret_cast<block_q8_1_mmvq2 *>(vy) + tile_idx;
+
+    __shared__ int raw_tile[16 * 9]; // 16 raw q8 blocks, each block = 9 ints
+
+    // Step 1: load raw q8 tile contiguously
+    for (int t = lane; t < 16 * 9; t += WARP_SIZE) {
+        raw_tile[t] = src_i[t];
+    }
+    __syncwarp();
+
+    // Step 2: repack into lane-major layout
+    const int k = lane >> 4;          // 0 or 1
+    const int g = (lane & 15) >> 2;   // 0..3
+    const int s = lane & 3;           // 0..3
+
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int b = k * 8 + 2 * g + p;      // raw q8 block index inside the tile
+        const int base = 9 * b;
+
+        dst->qlo[p][lane] = raw_tile[base + 1 + s];
+        dst->qhi[p][lane] = raw_tile[base + 5 + s];
+    }
+
+    // ds is small; only first 8 lanes handle it
+    if (lane < 8) {
+        const int kds = lane >> 2;   // 0 or 1
+        const int gds = lane & 3;    // 0..3
+
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+            const int b = kds * 8 + 2 * gds + p;
+            dst->ds[p][kds][gds] = static_cast<uint32_t>(raw_tile[9 * b + 0]);
+        }
+    }
+}
+
+
+void quantize_row_q8_1_mmvq2_cuda(
+    const float * x, const int32_t * ids, void * vy,
+    const ggml_type type_src0,
+    const int64_t ne00,
+    const int64_t s01, const int64_t s02, const int64_t s03,
+    const int64_t ne0, const int64_t ne1,
+    const int64_t ne2, const int64_t ne3,
+    cudaStream_t stream) {
+
+    GGML_ASSERT(!ids);
+    GGML_ASSERT(ne0 % (16 * QK8_1) == 0);   // padded row must be multiple of 512 values
+
+    // First do normal q8_1 quantization into vy
+    quantize_row_q8_1_cuda(
+        x, ids, vy, type_src0,
+        ne00, s01, s02, s03,
+        ne0, ne1, ne2, ne3, stream);
+
+    // Then repack in-place into block_q8_1_mmvq2 layout
+    const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
+    const int64_t tiles_per_row = ne0 / (16 * QK8_1);
+
+    const dim3 num_blocks(tiles_per_row, ne1, ne2 * ne3);
+    const dim3 block_size(WARP_SIZE, 1, 1);
+
+    pack_q8_1_mmvq2_inplace<<<num_blocks, block_size, 0, stream>>>(vy, ne0, ne1, ne2_fastdiv);
+    CUDA_CHECK(cudaGetLastError());
+    // Restore note: this temporary debug sync is capture-unsafe and aborts when
+    // quantize_row_q8_1_mmvq2_cuda() runs inside CUDA graph capture.
+    // CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+
 void quantize_mmq_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,

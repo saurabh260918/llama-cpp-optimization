@@ -1438,3 +1438,13 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_bias = nullptr;
     ggml_glu_op glu_op;
 };
+
+//added this new stuct to store the quantization parameters for q8_1 in the mmvq2 kernel to avoid having to load them from global memory multiple times
+struct alignas(32) block_q8_1_mmvq2 {
+    int qlo[2][32];      // pair p=0,1 ; lane-major
+    int qhi[2][32];      // pair p=0,1 ; lane-major
+    uint32_t ds [2][2][4]; // pair p, k=0/1, g=0..3
+};
+
+static_assert(sizeof(block_q8_1_mmvq2) == 16*sizeof(block_q8_1),
+              "wrong block_q8_1_mmvq2 size");

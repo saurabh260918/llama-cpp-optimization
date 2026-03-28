@@ -818,6 +818,62 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
 }
 
+//adding new code for mmvq2, same logic as above but with tile layout for q8_1
+static __device__ __forceinline__ float vec_dot_q4_K_q8_1_mmvq2(
+    const void * __restrict__ vbq,
+    const block_q8_1_mmvq2 * __restrict__ bq8_1,
+    // Restore note: this used to take a single `kbx`. That only works if the q8
+    // pointer is already advanced to the exact tile. In MMVQ we pass `bq8_1` at
+    // the row base, so q4 weights need the absolute block index while packed q8
+    // tiles need the block index local to the current y row.
+    const int & kbx_q4, const int & kbx_q8, const int & iqs) {
+
+    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx_q4;
+    const block_q8_1_mmvq2 & tile = bq8_1[kbx_q8 >> 1];
+
+    int v[2];
+    int u[2 * QR4_K];
+    float d8[QR4_K];
+
+    // ---------- original Q4_K side logic stays unchanged ----------
+    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));        // 0,2,4,6
+    const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    v[0] = q4[0];
+    v[1] = q4[4];
+
+    const uint16_t * scales = (const uint16_t *) bq4_K->scales;
+    uint16_t aux[2];
+    const int j = bq8_offset / 2;   // 0..3
+
+    if (j < 2) {
+        aux[0] = scales[j+0] & 0x3f3f;
+        aux[1] = scales[j+2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
+    }
+
+    const uint8_t * sc = (const uint8_t *) aux;
+    const uint8_t * m  = sc + 2;
+
+    // ---------- packed q8 side ----------
+    const int k = kbx_q8 & 1;           // which of the 2 kbx inside the tile
+    const int g = (iqs >> 3);           // (iqs/2) / 4
+    const int s = (iqs >> 1) & 0x3;     // (iqs/2) % 4
+    const int lane_idx = k * 16 + g * 4 + s;
+
+    d8[0] = __low2float(*reinterpret_cast<const ggml_half2 *>(&tile.ds[0][k][g]));
+    d8[1] = __low2float(*reinterpret_cast<const ggml_half2 *>(&tile.ds[1][k][g]));
+
+    u[0] = tile.qlo[0][lane_idx];
+    u[1] = tile.qhi[0][lane_idx];
+    u[2] = tile.qlo[1][lane_idx];
+    u[3] = tile.qhi[1][lane_idx];
+
+    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
+}
+
+
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
