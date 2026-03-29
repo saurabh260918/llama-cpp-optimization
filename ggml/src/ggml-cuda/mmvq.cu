@@ -137,6 +137,126 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
+template <int rows_per_cuda_block>
+__launch_bounds__(4 * WARP_SIZE, 1)
+static __global__ void mul_mat_vec_q4_K_ncols4_blackwell_raw(
+        const block_q4_K * __restrict__ vx,
+        const block_q8_1 * __restrict__ vy,
+        float * __restrict__ dst,
+        const uint32_t ncols_x,
+        const uint32_t nrows_x,
+        const uint3 channel_ratio,
+        const uint32_t stride_row_x,
+        const uint32_t stride_col_y,
+        const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst,
+        const uint3 sample_ratio,
+        const uint32_t stride_sample_x,
+        const uint32_t stride_sample_y,
+        const uint32_t stride_sample_dst) {
+
+    constexpr int ncols_dst = 4;
+    constexpr int nwarps = ncols_dst;
+    constexpr int q8_blocks_per_q4 = QK_K / QK8_1;
+    constexpr int int4_per_q4_block = sizeof(block_q4_K) / sizeof(int4);
+
+    const uint32_t row0 = rows_per_cuda_block * blockIdx.x;
+    if (row0 >= nrows_x) {
+        return;
+    }
+
+    const int lane = threadIdx.x;
+    const int warp_id = threadIdx.y;
+    const int linear_tid = warp_id * WARP_SIZE + lane;
+    const int subgroup = lane >> 4;
+    const int iqs = 2 * (lane & 15);
+
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t channel_x = fastdiv(channel_dst, channel_ratio);
+    const uint32_t channel_y = channel_dst;
+    const uint32_t sample_dst = blockIdx.z;
+    const uint32_t sample_x = fastdiv(sample_dst, sample_ratio);
+    const uint32_t sample_y = sample_dst;
+
+    const uint32_t rows_left = nrows_x - row0;
+    const uint32_t valid_rows = rows_left < rows_per_cuda_block ? rows_left : rows_per_cuda_block;
+    const uint32_t blocks_per_row_x = ncols_x / QK_K;
+
+    // Restore note: this is an original-layout experiment for Blackwell GPUs.
+    // It keeps raw Q4_K/Q8_1 storage, stages the raw Q4_K blocks in shared
+    // memory once per CTA, and lets each warp own one output column.
+    __shared__ block_q4_K x_block[rows_per_cuda_block][2];
+
+    const block_q4_K * x_base =
+        vx + sample_x * stride_sample_x + channel_x * stride_channel_x + row0 * stride_row_x;
+    const block_q8_1 * y_base =
+        vy + sample_y * stride_sample_y + channel_y * stride_channel_y + warp_id * stride_col_y;
+
+    float acc[rows_per_cuda_block] = { 0.0f };
+
+    for (uint32_t kbx_base = 0; kbx_base < blocks_per_row_x; kbx_base += 2) {
+        const uint32_t blocks_left = blocks_per_row_x - kbx_base;
+        const uint32_t valid_blocks = blocks_left < 2 ? blocks_left : 2;
+        const int total_int4 = valid_rows * valid_blocks * int4_per_q4_block;
+        int4 * x_block_vec4 = reinterpret_cast<int4 *>(x_block);
+
+        for (int idx = linear_tid; idx < total_int4; idx += nwarps * WARP_SIZE) {
+            const int row = idx / (valid_blocks * int4_per_q4_block);
+            const int rem = idx - row * (valid_blocks * int4_per_q4_block);
+            const int block_slot = rem / int4_per_q4_block;
+            const int inner = rem - block_slot * int4_per_q4_block;
+            const int4 * src_vec4 = reinterpret_cast<const int4 *>(&x_base[row * stride_row_x + kbx_base + block_slot]);
+            x_block_vec4[idx] = src_vec4[inner];
+        }
+
+        __syncthreads();
+
+        if (subgroup < valid_blocks) {
+            const uint32_t kbx = kbx_base + subgroup;
+            const uint32_t kby = kbx * q8_blocks_per_q4;
+            const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+
+            int u[2 * QR4_K];
+            float d8[QR4_K];
+
+#pragma unroll
+            for (int i = 0; i < QR4_K; ++i) {
+                const block_q8_1 * bq8i = y_base + kby + bq8_offset + i;
+                d8[i] = __low2float(bq8i->ds);
+
+                const int * q8 = (const int *) bq8i->qs + ((iqs/2)%4);
+                u[2*i+0] = q8[0];
+                u[2*i+1] = q8[4];
+            }
+
+#pragma unroll
+            for (int row = 0; row < rows_per_cuda_block; ++row) {
+                if (row < valid_rows) {
+                    acc[row] += vec_dot_q4_K_q8_1_cached_q8(x_block[row][subgroup], iqs, u, d8);
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int row = 0; row < rows_per_cuda_block; ++row) {
+        if (row < valid_rows) {
+            acc[row] = warp_reduce_sum(acc[row]);
+        }
+    }
+
+    float * dst_col =
+        dst + sample_dst * stride_sample_dst + channel_dst * stride_channel_dst + warp_id * stride_col_dst + row0;
+
+    if (lane < valid_rows) {
+        dst_col[lane] = acc[lane];
+    }
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool is_multi_token_id = false>
 __launch_bounds__(calc_nwarps(ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)   // vx= (13824X5120) vy = (5120X1)
 static __global__ void mul_mat_vec_q(
@@ -415,6 +535,45 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
     const bool has_ids = ids != nullptr;
+
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        const int cc = ggml_cuda_info().devices[device].cc;
+        const bool use_blackwell_q4k_ncols4 =
+            !has_fusion &&
+            !has_ids &&
+            ncols_dst == 4 &&
+            GGML_CUDA_CC_IS_NVIDIA(cc) &&
+            cc >= GGML_CUDA_CC_BLACKWELL;
+
+        if (use_blackwell_q4k_ncols4) {
+            constexpr int c_rows_per_cuda_block = 2;
+            const dim3 block_dims(WARP_SIZE, 4, 1);
+            const dim3 block_nums(
+                (nrows_x + c_rows_per_cuda_block - 1) / c_rows_per_cuda_block,
+                nchannels_dst,
+                nsamples_dst);
+
+            mul_mat_vec_q4_K_ncols4_blackwell_raw<c_rows_per_cuda_block><<<block_nums, block_dims, 0, stream>>>(
+                static_cast<const block_q4_K *>(vx),
+                static_cast<const block_q8_1 *>(vy),
+                dst,
+                ncols_x,
+                nrows_x,
+                channel_ratio_fd,
+                stride_row_x,
+                stride_col_y,
+                stride_col_dst,
+                stride_channel_x,
+                stride_channel_y,
+                stride_channel_dst,
+                sample_ratio_fd,
+                stride_sample_x,
+                stride_sample_y,
+                stride_sample_dst);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
 
     if (has_ids && ncols_dst > 1) {
         // Multi-token MUL_MAT_ID path only - single-token goes through regular path below
