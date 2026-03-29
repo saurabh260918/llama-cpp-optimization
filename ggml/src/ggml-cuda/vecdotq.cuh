@@ -923,6 +923,31 @@ static __device__ __forceinline__ float vec_dot_q4_K_mmvq2_q8_1_mmvq2(
     return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, dm4, d8);
 }
 
+static __device__ __forceinline__ float vec_dot_q4_K_mmvq2_q8_1_mmvq2_cached_q8(
+    const block_q4_K_mmvq2 & tile_q4,
+    const int & k,
+    const int & iqs,
+    const int * __restrict__ u,
+    const float * __restrict__ d8) {
+
+    int v[2];
+    uint8_t aux[2 * QR4_K];
+
+    const int g = (iqs >> 3);
+    const int s = (iqs >> 1) & 0x3;
+    const int lane_idx = k * 16 + g * 4 + s;
+
+    v[0] = tile_q4.qv0[lane_idx];
+    v[1] = tile_q4.qv1[lane_idx];
+
+    unpack_q4_K_sm6_mmvq2(tile_q4.sm6[k][g], aux);
+    const uint8_t * sc = aux;
+    const uint8_t * m  = aux + 2;
+
+    const half2 dm4 = reinterpret_cast<const half2 *>(tile_q4.dm)[k];
+    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, dm4, d8);
+}
+
 
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
