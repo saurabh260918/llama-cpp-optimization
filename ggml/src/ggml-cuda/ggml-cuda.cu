@@ -566,10 +566,77 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
+static size_t ggml_cuda_q4_k_mmvq2_nbytes(const ggml_tensor * tensor, const int64_t nrows) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_Q4_K);
+
+    const int64_t blocks_per_row_x = tensor->ne[0] / QK_K;
+    const int64_t tiles_per_row_x  = (blocks_per_row_x + 1) / 2;
+
+    return tensor->ne[3] * tensor->ne[2] * nrows * tiles_per_row_x * sizeof(block_q4_K_mmvq2);
+}
+
+static bool ggml_cuda_should_cache_q4_k_mmvq2(const ggml_backend_buffer_t buffer, const ggml_tensor * tensor) {
+    return tensor->type == GGML_TYPE_Q4_K &&
+           tensor->view_src == nullptr &&
+           ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE;
+}
+
+static void ggml_cuda_invalidate_q4_k_mmvq2_cache(ggml_tensor_extra_gpu * extra, const int device) {
+    if (extra != nullptr && extra->q4_k_mmvq2_device[device] != nullptr) {
+        CUDA_CHECK(cudaFree(extra->q4_k_mmvq2_device[device]));
+        extra->q4_k_mmvq2_device[device] = nullptr;
+    }
+}
+
+static void ggml_cuda_update_q4_k_mmvq2_cache(
+        const ggml_tensor * tensor,
+        ggml_tensor_extra_gpu * extra,
+        const int device,
+        const void * src_device,
+        cudaStream_t stream) {
+    if (extra == nullptr || !ggml_cuda_should_cache_q4_k_mmvq2(tensor->buffer, tensor) || !ggml_is_contiguously_allocated(tensor)) {
+        return;
+    }
+
+    const size_t nbytes_packed = ggml_cuda_q4_k_mmvq2_nbytes(tensor, tensor->ne[1]);
+    if (extra->q4_k_mmvq2_device[device] == nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(ggml_cuda_device_malloc(&extra->q4_k_mmvq2_device[device], nbytes_packed, device));
+    }
+
+    const int64_t ts_src0 = ggml_type_size(tensor->type);
+    const int64_t s01_raw = tensor->nb[1] / ts_src0;
+    const int64_t s02_raw = tensor->nb[2] / ts_src0;
+    const int64_t s03_raw = tensor->nb[3] / ts_src0;
+
+    repack_row_q4_K_mmvq2_cuda(
+        src_device, extra->q4_k_mmvq2_device[device],
+        tensor->ne[0], s01_raw, s02_raw, s03_raw, tensor->ne[1], tensor->ne[2], tensor->ne[3], stream);
+}
+
+static void ggml_cuda_free_tensor_extra(ggml_tensor_extra_gpu * extra, const bool free_data_device) {
+    for (int id = 0; id < GGML_CUDA_MAX_DEVICES; ++id) {
+        for (int64_t is = 0; is < GGML_CUDA_MAX_STREAMS; ++is) {
+            if (extra->events[id][is] != nullptr) {
+                CUDA_CHECK(cudaEventDestroy(extra->events[id][is]));
+            }
+        }
+        if (free_data_device && extra->data_device[id] != nullptr) {
+            CUDA_CHECK(cudaFree(extra->data_device[id]));
+        }
+        if (extra->q4_k_mmvq2_device[id] != nullptr) {
+            CUDA_CHECK(cudaFree(extra->q4_k_mmvq2_device[id]));
+        }
+    }
+
+    delete extra;
+}
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+    std::vector<ggml_tensor_extra_gpu *> tensor_extras;
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -577,6 +644,9 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+        for (ggml_tensor_extra_gpu * extra : tensor_extras) {
+            ggml_cuda_free_tensor_extra(extra, false);
+        }
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -603,6 +673,12 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
         return GGML_STATUS_SUCCESS;
     }
 
+    if (ggml_cuda_should_cache_q4_k_mmvq2(buffer, tensor)) {
+        ggml_tensor_extra_gpu * extra = new ggml_tensor_extra_gpu{};
+        ctx->tensor_extras.push_back(extra);
+        tensor->extra = extra;
+    }
+
     if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         // initialize padding to 0 to avoid possible NaN values
         const size_t original_size = ggml_nbytes(tensor);
@@ -621,6 +697,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync((char *)tensor->data + offset, value, size, cudaStreamPerThread));
+    ggml_cuda_invalidate_q4_k_mmvq2_cache((ggml_tensor_extra_gpu *) tensor->extra, ctx->device);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -629,6 +706,11 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    if (offset == 0 && size == ggml_nbytes(tensor)) {
+        ggml_cuda_update_q4_k_mmvq2_cache(tensor, (ggml_tensor_extra_gpu *) tensor->extra, ctx->device, tensor->data, cudaStreamPerThread);
+    } else {
+        ggml_cuda_invalidate_q4_k_mmvq2_cache((ggml_tensor_extra_gpu *) tensor->extra, ctx->device);
+    }
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -653,6 +735,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_ctx->device, src->data, src_ctx->device, ggml_nbytes(src), cudaStreamPerThread));
 #endif
         }
+        ggml_cuda_update_q4_k_mmvq2_cache(dst, (ggml_tensor_extra_gpu *) dst->extra, dst_ctx->device, dst->data, cudaStreamPerThread);
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
         return true;
     }
@@ -818,17 +901,7 @@ struct ggml_backend_cuda_split_buffer_type_context {
 struct ggml_backend_cuda_split_buffer_context {
     ~ggml_backend_cuda_split_buffer_context() {
         for (ggml_tensor_extra_gpu * extra : tensor_extras) {
-            for (int id = 0; id < GGML_CUDA_MAX_DEVICES; ++id) {
-                for (int64_t is = 0; is < GGML_CUDA_MAX_STREAMS; ++is) {
-                    if (extra->events[id][is] != nullptr) {
-                        CUDA_CHECK(cudaEventDestroy(extra->events[id][is]));
-                    }
-                }
-                if (extra->data_device[id] != nullptr) {
-                    CUDA_CHECK(cudaFree(extra->data_device[id]));
-                }
-            }
-            delete extra;
+            ggml_cuda_free_tensor_extra(extra, true);
         }
     }
 

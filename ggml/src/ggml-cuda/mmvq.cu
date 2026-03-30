@@ -717,6 +717,8 @@ void ggml_cuda_mul_mat_vec_q(
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
 
+    const ggml_tensor_extra_gpu * src0_extra = (const ggml_tensor_extra_gpu *) src0->extra;
+
     ggml_cuda_mm_fusion_args_device fusion_local{};
 
     if (fusion) {
@@ -789,23 +791,35 @@ void ggml_cuda_mul_mat_vec_q(
     int64_t s03 = s03_raw;
 
     if (src0->type == GGML_TYPE_Q4_K) {
-        const size_t nbytes_src0_q4_k_mmvq2 = ne03 * ne02 * ne01 * tiles_per_row_x * sizeof(block_q4_K_mmvq2);
-        src0_q4_k_mmvq2.alloc(ctx.pool(), nbytes_src0_q4_k_mmvq2);
-        repack_row_q4_K_mmvq2_cuda(
-            src0->data, src0_q4_k_mmvq2.get(),
-            ne00, s01_raw, s02_raw, s03_raw, ne01, ne02, ne03, stream);
+        // Prefer the persistent packed cache when available; keep the old temporary repack
+        // as a fallback so non-cached tensors still work.
+        if (src0_extra && src0_extra->q4_k_mmvq2_device[ctx.device] != nullptr) {
+            vx_mmvq = src0_extra->q4_k_mmvq2_device[ctx.device];
+        } else {
+            const size_t nbytes_src0_q4_k_mmvq2 = ne03 * ne02 * ne01 * tiles_per_row_x * sizeof(block_q4_K_mmvq2);
+            src0_q4_k_mmvq2.alloc(ctx.pool(), nbytes_src0_q4_k_mmvq2);
+            repack_row_q4_K_mmvq2_cuda(
+                src0->data, src0_q4_k_mmvq2.get(),
+                ne00, s01_raw, s02_raw, s03_raw, ne01, ne02, ne03, stream);
+            vx_mmvq = src0_q4_k_mmvq2.get();
+        }
 
-        vx_mmvq = src0_q4_k_mmvq2.get();
         s01 = tiles_per_row_x;
         s02 = ne01 * s01;
         s03 = ne02 * s02;
 
         if (fusion && fusion->gate) {
-            gate_q4_k_mmvq2.alloc(ctx.pool(), nbytes_src0_q4_k_mmvq2);
-            repack_row_q4_K_mmvq2_cuda(
-                fusion->gate->data, gate_q4_k_mmvq2.get(),
-                ne00, s01_raw, s02_raw, s03_raw, ne01, ne02, ne03, stream);
-            fusion_local.gate = gate_q4_k_mmvq2.get();
+            const ggml_tensor_extra_gpu * gate_extra = (const ggml_tensor_extra_gpu *) fusion->gate->extra;
+            if (gate_extra && gate_extra->q4_k_mmvq2_device[ctx.device] != nullptr) {
+                fusion_local.gate = gate_extra->q4_k_mmvq2_device[ctx.device];
+            } else {
+                const size_t nbytes_src0_q4_k_mmvq2 = ne03 * ne02 * ne01 * tiles_per_row_x * sizeof(block_q4_K_mmvq2);
+                gate_q4_k_mmvq2.alloc(ctx.pool(), nbytes_src0_q4_k_mmvq2);
+                repack_row_q4_K_mmvq2_cuda(
+                    fusion->gate->data, gate_q4_k_mmvq2.get(),
+                    ne00, s01_raw, s02_raw, s03_raw, ne01, ne02, ne03, stream);
+                fusion_local.gate = gate_q4_k_mmvq2.get();
+            }
         }
     }
 
