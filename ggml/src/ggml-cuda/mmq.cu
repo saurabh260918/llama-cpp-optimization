@@ -91,6 +91,7 @@ void ggml_cuda_mul_mat_q(
     const char  * src0_d = (const char  *) src0->data;
     const float * src1_d = (const float *) src1->data;
     float       *  dst_d = (float       *)  dst->data;
+    ggml_cuda_pool_alloc<char> src0_q4_k_raw(ctx.pool());
 
     // If src0 is a temporary compute buffer, clear any potential padding.
     if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
@@ -111,6 +112,19 @@ void ggml_cuda_mul_mat_q(
     const int64_t s2  =  dst->nb[2] / ts_dst;
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
+
+    const ggml_tensor_extra_gpu * src0_extra = (const ggml_tensor_extra_gpu *) src0->extra;
+    if (src0->type == GGML_TYPE_Q4_K && src0_extra && src0_extra->q4_k_mmvq2_in_data[ctx.device] != 0) {
+        const size_t nbytes_data = ggml_nbytes(src0);
+        const size_t nbytes_padding = ne00 % MATRIX_ROW_PADDING == 0 ? 0 :
+            ggml_row_size(src0->type, MATRIX_ROW_PADDING - ne00 % MATRIX_ROW_PADDING);
+        src0_q4_k_raw.alloc(nbytes_data + nbytes_padding);
+        CUDA_CHECK(cudaMemsetAsync(src0_q4_k_raw.get(), 0, nbytes_data + nbytes_padding, stream));
+        unpack_row_q4_K_mmvq2_cuda(
+            src0->data, src0_q4_k_raw.get(),
+            ne00, s01, s02, s03, ne01, ne02, ne03, stream);
+        src0_d = src0_q4_k_raw.get();
+    }
 
     const bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
                             || GGML_CUDA_CC_IS_CDNA(cc);

@@ -1,5 +1,6 @@
 #include "quantize.cuh"
 #include <cstdint>
+#include <cstring>
 
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
@@ -393,7 +394,7 @@ void quantize_row_q8_1_mmvq2_cuda(
     GGML_UNUSED(type_src0);
 }
 
-static __device__ __forceinline__ uint32_t pack_q4_K_sm6_values(
+static __host__ __device__ __forceinline__ uint32_t pack_q4_K_sm6_values(
         const uint8_t sc0, const uint8_t sc1, const uint8_t m0, const uint8_t m1) {
     return (uint32_t(sc0) & 0x3fu)
          | ((uint32_t(sc1) & 0x3fu) <<  6)
@@ -401,7 +402,7 @@ static __device__ __forceinline__ uint32_t pack_q4_K_sm6_values(
          | ((uint32_t(m1)  & 0x3fu) << 18);
 }
 
-static __device__ __forceinline__ uint32_t pack_q4_K_sm6_group(const block_q4_K & src, const int g) {
+static __host__ __device__ __forceinline__ uint32_t pack_q4_K_sm6_group(const block_q4_K & src, const int g) {
     const uint16_t * scales = reinterpret_cast<const uint16_t *>(src.scales);
     uint16_t aux[2];
 
@@ -415,6 +416,31 @@ static __device__ __forceinline__ uint32_t pack_q4_K_sm6_group(const block_q4_K 
 
     const uint8_t * sc = reinterpret_cast<const uint8_t *>(aux);
     return pack_q4_K_sm6_values(sc[0], sc[1], sc[2], sc[3]);
+}
+
+static __host__ __device__ __forceinline__ void unpack_q4_K_sm6_group(
+        const uint8_t packed[3], uint8_t unpacked[4]) {
+    const uint32_t sm = uint32_t(packed[0])
+                      | (uint32_t(packed[1]) << 8)
+                      | (uint32_t(packed[2]) << 16);
+
+    unpacked[0] = sm & 0x3f;
+    unpacked[1] = (sm >>  6) & 0x3f;
+    unpacked[2] = (sm >> 12) & 0x3f;
+    unpacked[3] = (sm >> 18) & 0x3f;
+}
+
+static __host__ __device__ __forceinline__ void rebuild_q4_K_scales(
+        const uint8_t d[8], const uint8_t m[8], uint8_t dst[12]) {
+    for (int i = 0; i < 12; ++i) {
+        dst[i] = 0;
+    }
+
+    for (int j = 0; j < 4; ++j) {
+        dst[j + 0] = (d[j + 0] & 0x3f) | (((d[j + 4] >> 4) & 0x03) << 6);
+        dst[j + 4] = (m[j + 0] & 0x3f) | (((m[j + 4] >> 4) & 0x03) << 6);
+        dst[j + 8] = (d[j + 4] & 0x0f) | ((m[j + 4] & 0x0f) << 4);
+    }
 }
 
 static __global__ void repack_q4_K_mmvq2(
@@ -491,6 +517,186 @@ void repack_row_q4_K_mmvq2_cuda(
         reinterpret_cast<block_q4_K_mmvq2 *>(vy),
         blocks_per_row, s01, s02, s03, ne01, ne02_fastdiv);
     // CUDA_CHECK(cudaGetLastError());
+}
+
+void repack_row_q4_K_mmvq2_cpu(
+        const void * vx, void * vy,
+        const int64_t ne00,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne01, const int64_t ne02, const int64_t ne03) {
+    GGML_ASSERT(ne00 % QK_K == 0);
+
+    const int64_t blocks_per_row = ne00 / QK_K;
+    const int64_t tiles_per_row  = (blocks_per_row + 1) / 2;
+
+    const block_q4_K * src = reinterpret_cast<const block_q4_K *>(vx);
+    block_q4_K_mmvq2 * dst = reinterpret_cast<block_q4_K_mmvq2 *>(vy);
+
+    for (int64_t i3 = 0; i3 < ne03; ++i3) {
+        for (int64_t i2 = 0; i2 < ne02; ++i2) {
+            const int64_t row_group = i3 * ne02 + i2;
+            for (int64_t i1 = 0; i1 < ne01; ++i1) {
+                const int64_t src_block0 = i3 * s03 + i2 * s02 + i1 * s01;
+                for (int64_t tile_in_row = 0; tile_in_row < tiles_per_row; ++tile_in_row) {
+                    block_q4_K_mmvq2 & tile = dst[(row_group * ne01 + i1) * tiles_per_row + tile_in_row];
+                    memset(&tile, 0, sizeof(tile));
+
+                    for (int k = 0; k < 2; ++k) {
+                        const int64_t src_block = src_block0 + tile_in_row * 2 + k;
+                        if (src_block >= src_block0 + blocks_per_row) {
+                            continue;
+                        }
+
+                        const block_q4_K & raw = src[src_block];
+                        tile.dm[k] = reinterpret_cast<const uint32_t *>(&raw.dm)[0];
+
+                        for (int g = 0; g < 4; ++g) {
+                            const uint32_t packed = pack_q4_K_sm6_group(raw, g);
+                            tile.sm6[k][g][0] = packed & 0xff;
+                            tile.sm6[k][g][1] = (packed >> 8) & 0xff;
+                            tile.sm6[k][g][2] = (packed >> 16) & 0xff;
+
+                            for (int s = 0; s < 4; ++s) {
+                                const int lane = k * 16 + g * 4 + s;
+                                const int * q4 = reinterpret_cast<const int *>(raw.qs + 32 * g + 4 * s);
+                                tile.qv0[lane] = q4[0];
+                                tile.qv1[lane] = q4[4];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static __global__ void unpack_q4_K_mmvq2(
+        const block_q4_K_mmvq2 * __restrict__ vx, block_q4_K * __restrict__ vy,
+        const int64_t blocks_per_row,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne01, const uint3 ne02_fastdiv) {
+    const int lane = threadIdx.x;
+    const int64_t tile_in_row = blockIdx.x;
+    const int64_t i3 = fastdiv(blockIdx.z, ne02_fastdiv);
+    const int64_t i2 = blockIdx.z - i3 * ne02_fastdiv.z;
+    const int64_t i1 = blockIdx.y;
+    const int64_t tiles_per_row = (blocks_per_row + 1) / 2;
+
+    const int64_t row_group = i3 * ne02_fastdiv.z + i2;
+    const int64_t dst_block0 = i3 * s03 + i2 * s02 + i1 * s01 + tile_in_row * 2;
+    const int64_t src_tile = (row_group * ne01 + i1) * tiles_per_row + tile_in_row;
+
+    const block_q4_K_mmvq2 & tile = vx[src_tile];
+
+    const int k = lane >> 4;
+    const int g = (lane & 15) >> 2;
+    const int s = lane & 3;
+    const int64_t dst_block = dst_block0 + k;
+
+    if (dst_block < i3 * s03 + i2 * s02 + i1 * s01 + blocks_per_row) {
+        block_q4_K & raw = vy[dst_block];
+        int * q4 = reinterpret_cast<int *>(raw.qs + 32 * g + 4 * s);
+        const int tile_lane = k * 16 + g * 4 + s;
+        q4[0] = tile.qv0[tile_lane];
+        q4[4] = tile.qv1[tile_lane];
+    }
+
+    if (lane < 2) {
+        const int64_t dst_block_meta = dst_block0 + lane;
+        if (dst_block_meta < i3 * s03 + i2 * s02 + i1 * s01 + blocks_per_row) {
+            block_q4_K & raw = vy[dst_block_meta];
+            reinterpret_cast<uint32_t *>(&raw.dm)[0] = tile.dm[lane];
+
+            uint8_t d[8];
+            uint8_t m[8];
+            for (int g_idx = 0; g_idx < 4; ++g_idx) {
+                uint8_t aux[4];
+                unpack_q4_K_sm6_group(tile.sm6[lane][g_idx], aux);
+                d[2 * g_idx + 0] = aux[0];
+                d[2 * g_idx + 1] = aux[1];
+                m[2 * g_idx + 0] = aux[2];
+                m[2 * g_idx + 1] = aux[3];
+            }
+            rebuild_q4_K_scales(d, m, raw.scales);
+        }
+    }
+}
+
+void unpack_row_q4_K_mmvq2_cuda(
+        const void * vx, void * vy,
+        const int64_t ne00,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_K == 0);
+
+    const int64_t blocks_per_row = ne00 / QK_K;
+    const int64_t tiles_per_row = (blocks_per_row + 1) / 2;
+    const uint3 ne02_fastdiv = init_fastdiv_values(ne02);
+
+    const dim3 num_blocks(tiles_per_row, ne01, ne02 * ne03);
+    const dim3 block_size(WARP_SIZE, 1, 1);
+    unpack_q4_K_mmvq2<<<num_blocks, block_size, 0, stream>>>(
+        reinterpret_cast<const block_q4_K_mmvq2 *>(vx),
+        reinterpret_cast<block_q4_K *>(vy),
+        blocks_per_row, s01, s02, s03, ne01, ne02_fastdiv);
+}
+
+void unpack_row_q4_K_mmvq2_cpu(
+        const void * vx, void * vy,
+        const int64_t ne00,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne01, const int64_t ne02, const int64_t ne03) {
+    GGML_ASSERT(ne00 % QK_K == 0);
+
+    const int64_t blocks_per_row = ne00 / QK_K;
+    const int64_t tiles_per_row  = (blocks_per_row + 1) / 2;
+
+    const block_q4_K_mmvq2 * src = reinterpret_cast<const block_q4_K_mmvq2 *>(vx);
+    block_q4_K * dst = reinterpret_cast<block_q4_K *>(vy);
+
+    for (int64_t i3 = 0; i3 < ne03; ++i3) {
+        for (int64_t i2 = 0; i2 < ne02; ++i2) {
+            const int64_t row_group = i3 * ne02 + i2;
+            for (int64_t i1 = 0; i1 < ne01; ++i1) {
+                const int64_t dst_block0 = i3 * s03 + i2 * s02 + i1 * s01;
+                for (int64_t tile_in_row = 0; tile_in_row < tiles_per_row; ++tile_in_row) {
+                    const block_q4_K_mmvq2 & tile = src[(row_group * ne01 + i1) * tiles_per_row + tile_in_row];
+
+                    for (int k = 0; k < 2; ++k) {
+                        const int64_t dst_block = dst_block0 + tile_in_row * 2 + k;
+                        if (dst_block >= dst_block0 + blocks_per_row) {
+                            continue;
+                        }
+
+                        block_q4_K & raw = dst[dst_block];
+                        memset(&raw, 0, sizeof(raw));
+                        reinterpret_cast<uint32_t *>(&raw.dm)[0] = tile.dm[k];
+
+                        uint8_t d[8];
+                        uint8_t m[8];
+                        for (int g = 0; g < 4; ++g) {
+                            uint8_t aux[4];
+                            unpack_q4_K_sm6_group(tile.sm6[k][g], aux);
+                            d[2 * g + 0] = aux[0];
+                            d[2 * g + 1] = aux[1];
+                            m[2 * g + 0] = aux[2];
+                            m[2 * g + 1] = aux[3];
+
+                            for (int s = 0; s < 4; ++s) {
+                                const int lane = k * 16 + g * 4 + s;
+                                int * q4 = reinterpret_cast<int *>(raw.qs + 32 * g + 4 * s);
+                                q4[0] = tile.qv0[lane];
+                                q4[4] = tile.qv1[lane];
+                            }
+                        }
+
+                        rebuild_q4_K_scales(d, m, raw.scales);
+                    }
+                }
+            }
+        }
+    }
 }
 
 

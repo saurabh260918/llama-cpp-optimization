@@ -55,3 +55,22 @@ void repack_row_q4_K_mmvq2_cuda(
     const int64_t s01, const int64_t s02, const int64_t s03,
     const int64_t ne01, const int64_t ne02, const int64_t ne03,
     cudaStream_t stream);
+
+void repack_row_q4_K_mmvq2_cpu(
+    const void * vx, void * vy,
+    const int64_t ne00,
+    const int64_t s01, const int64_t s02, const int64_t s03,
+    const int64_t ne01, const int64_t ne02, const int64_t ne03);
+
+void unpack_row_q4_K_mmvq2_cuda(
+    const void * vx, void * vy,
+    const int64_t ne00,
+    const int64_t s01, const int64_t s02, const int64_t s03,
+    const int64_t ne01, const int64_t ne02, const int64_t ne03,
+    cudaStream_t stream);
+
+void unpack_row_q4_K_mmvq2_cpu(
+    const void * vx, void * vy,
+    const int64_t ne00,
+    const int64_t s01, const int64_t s02, const int64_t s03,
+    const int64_t ne01, const int64_t ne02, const int64_t ne03);

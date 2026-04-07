@@ -1115,6 +1115,7 @@ struct ggml_tensor_extra_gpu {
     void * data_device[GGML_CUDA_MAX_DEVICES]; // 1 pointer for each device for split tensors
     cudaEvent_t events[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS]; // events for synchronizing multiple GPUs
     void * q4_k_mmvq2_device[GGML_CUDA_MAX_DEVICES]; // persistent packed Q4_K cache, one pointer per device
+    uint8_t q4_k_mmvq2_in_data[GGML_CUDA_MAX_DEVICES]; // tensor->data already stores packed Q4_K tiles for this device
 };
 
 
