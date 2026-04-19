@@ -15,3 +15,12 @@ Initial scope:
 - Do not change numerics or quantization semantics.
 - First prototype the Q4_K read path only.
 - Validate with small smoke tests before collecting NCU/NSYS profiles.
+
+Current prototype:
+- CUDA Q4_K tensor upload still copies the original raw block_q4_K AoS data into
+  tensor->data, so existing MMQ/dequant/cuBLAS fallback consumers can keep using
+  the normal format.
+- After raw upload, a one-time CUDA pack kernel builds a persistent side cache in
+  SoA layout: dm_array, scales_array, qs_array.
+- MMVQ Q4_K consumes the SoA side cache through vec_dot_q4_K_q8_1_soa when the
+  cache exists, and falls back to raw block_q4_K otherwise.

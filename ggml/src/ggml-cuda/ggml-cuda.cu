@@ -85,6 +85,74 @@
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
+#ifndef GGML_CUDA_Q4_K_SOA_EXPERIMENT
+#define GGML_CUDA_Q4_K_SOA_EXPERIMENT 1
+#endif
+
+#if GGML_CUDA_Q4_K_SOA_EXPERIMENT
+static constexpr size_t Q4_K_SOA_DM_SIZE     = sizeof(ggml_half2);
+static constexpr size_t Q4_K_SOA_SCALES_SIZE = K_SCALE_SIZE;
+static constexpr size_t Q4_K_SOA_QS_SIZE     = QK_K/2;
+
+static_assert(Q4_K_SOA_DM_SIZE + Q4_K_SOA_SCALES_SIZE + Q4_K_SOA_QS_SIZE == sizeof(block_q4_K),
+              "Q4_K SoA slices must preserve the original block footprint");
+
+static bool ggml_cuda_q4_K_should_cache_soa(const ggml_tensor * tensor) {
+    return tensor->type == GGML_TYPE_Q4_K && tensor->view_src == nullptr && ggml_is_contiguous(tensor);
+}
+
+static __global__ void q4_K_aos_to_soa_kernel(
+        const block_q4_K * __restrict__ src, uint8_t * __restrict__ dst,
+        const size_t block_offset, const size_t nblocks, const size_t nblocks_total) {
+    const size_t ib_local = (size_t) blockDim.x*blockIdx.x + threadIdx.x;
+    if (ib_local >= nblocks) {
+        return;
+    }
+
+    const size_t ib = block_offset + ib_local;
+
+    ggml_half2 * dm_dst     = (ggml_half2 *) dst;
+    uint8_t    * scales_dst = dst + nblocks_total*Q4_K_SOA_DM_SIZE;
+    uint8_t    * qs_dst     = scales_dst + nblocks_total*Q4_K_SOA_SCALES_SIZE;
+
+    const block_q4_K & block = src[ib];
+    dm_dst[ib] = block.dm;
+
+#pragma unroll
+    for (int i = 0; i < K_SCALE_SIZE; ++i) {
+        scales_dst[ib*K_SCALE_SIZE + i] = block.scales[i];
+    }
+
+#pragma unroll
+    for (int i = 0; i < QK_K/2; ++i) {
+        qs_dst[ib*(QK_K/2) + i] = block.qs[i];
+    }
+}
+
+static void ggml_cuda_q4_K_launch_soa_pack(ggml_tensor * tensor, const size_t offset, const size_t size, cudaStream_t stream) {
+    if (!ggml_cuda_q4_K_should_cache_soa(tensor) || tensor->extra == nullptr) {
+        return;
+    }
+
+    GGML_ASSERT(offset % sizeof(block_q4_K) == 0);
+    GGML_ASSERT(size   % sizeof(block_q4_K) == 0);
+    GGML_ASSERT(ggml_nbytes(tensor) % sizeof(block_q4_K) == 0);
+
+    ggml_tensor_extra_gpu * extra = (ggml_tensor_extra_gpu *) tensor->extra;
+    const int device = ggml_cuda_get_device();
+    uint8_t * soa = (uint8_t *) extra->data_device[device];
+    GGML_ASSERT(soa != nullptr);
+
+    const size_t block_offset = offset / sizeof(block_q4_K);
+    const size_t nblocks = size / sizeof(block_q4_K);
+    const size_t nblocks_total = ggml_nbytes(tensor) / sizeof(block_q4_K);
+    constexpr int block_size = 256;
+    const dim3 block_nums((nblocks + block_size - 1) / block_size);
+    q4_K_aos_to_soa_kernel<<<block_nums, block_size, 0, stream>>>(
+        (const block_q4_K *) tensor->data, soa, block_offset, nblocks, nblocks_total);
+}
+#endif
+
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
     int id = -1; // in case cudaGetDevice fails
@@ -570,6 +638,9 @@ struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+#if GGML_CUDA_Q4_K_SOA_EXPERIMENT
+    std::vector<ggml_tensor_extra_gpu *> tensor_extras;
+#endif
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -577,6 +648,16 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+#if GGML_CUDA_Q4_K_SOA_EXPERIMENT
+        for (ggml_tensor_extra_gpu * extra : tensor_extras) {
+            for (void * ptr : extra->data_device) {
+                if (ptr != nullptr) {
+                    CUDA_CHECK(cudaFree(ptr));
+                }
+            }
+            delete extra;
+        }
+#endif
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -613,6 +694,17 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
             CUDA_CHECK(cudaMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
         }
     }
+#if GGML_CUDA_Q4_K_SOA_EXPERIMENT
+    if (ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && ggml_cuda_q4_K_should_cache_soa(tensor)) {
+        GGML_ASSERT(tensor->extra == nullptr);
+        GGML_ASSERT(ggml_nbytes(tensor) % sizeof(block_q4_K) == 0);
+
+        ggml_tensor_extra_gpu * extra = new ggml_tensor_extra_gpu{};
+        CUDA_CHECK(ggml_cuda_device_malloc(&extra->data_device[ctx->device], ggml_nbytes(tensor), ctx->device));
+        tensor->extra = extra;
+        ctx->tensor_extras.push_back(extra);
+    }
+#endif
     return GGML_STATUS_SUCCESS;
 }
 
@@ -629,6 +721,9 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+#if GGML_CUDA_Q4_K_SOA_EXPERIMENT
+    ggml_cuda_q4_K_launch_soa_pack(tensor, offset, size, cudaStreamPerThread);
+#endif
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
