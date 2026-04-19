@@ -1,0 +1,17 @@
+Q4_K SoA experiment branch
+
+This branch starts from the clean main commit and is reserved for exploring a
+structure-of-arrays layout for Q4_K tensors.
+
+High-level goal:
+- Separate Q4_K block fields into independently addressable dm, scales, and qs
+  storage.
+- Study whether MMQ and MMVQ can consume that layout with more coalesced global
+  memory access than the original block_q4_K array-of-structures layout.
+- Keep correctness as the first priority, then compare memory-sector behavior,
+  kernel time, and end-to-end performance against main and pack_opt.
+
+Initial scope:
+- Do not change numerics or quantization semantics.
+- First prototype the Q4_K read path only.
+- Validate with small smoke tests before collecting NCU/NSYS profiles.
