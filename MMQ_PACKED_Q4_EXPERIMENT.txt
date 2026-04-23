@@ -1,0 +1,13 @@
+Experiment note: MMQ packed Q4_K path
+
+Branch: exp/mmq_packed_Q4
+Base branch: pack_opt
+
+Goal:
+Experiment with feeding the existing packed Q4_K MMVQ data layout into the MMQ path.
+
+Initial direction:
+- Keep the current packed Q4_K MMVQ layout as the starting point.
+- Analyze how qv0/qv1, sm6, and dm can be mapped into the MMQ shared-memory layout.
+- Only change code after the mapping looks reasonable and measurable.
+
