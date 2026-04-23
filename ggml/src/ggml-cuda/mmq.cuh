@@ -1981,6 +1981,21 @@ static __device__ __forceinline__ int unpack_scales_q45_K(const int * scales, co
            ((scales[ksc/2]              >> (2 * (ksc % 2)))       & 0x30303030);  // upper 2 bits
 }
 
+static __device__ __forceinline__ int pack_q4_K_mmvq2_scales8(const block_q4_K_mmvq2 * bxi, const int k, const int ksc) {
+    uint8_t aux0[4];
+    uint8_t aux1[4];
+
+    const int pair = ksc & 1;
+    unpack_q4_K_sm6_mmvq2(bxi->sm6[k][2*pair + 0], aux0);
+    unpack_q4_K_sm6_mmvq2(bxi->sm6[k][2*pair + 1], aux1);
+
+    const int offset = ksc < 2 ? 0 : 2;
+    return int(aux0[offset + 0])
+        | (int(aux0[offset + 1]) <<  8)
+        | (int(aux1[offset + 0]) << 16)
+        | (int(aux1[offset + 1]) << 24);
+}
+
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_q4_K(
     const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int nwarps = mmq_get_nwarps_device();
@@ -1999,6 +2014,8 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     constexpr int threads_per_row = MMQ_ITER_K / (4 * QR4_K);
     constexpr int nrows = warp_size / threads_per_row;
     const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int k = kbx0 & 1;
+    const int tile_kbx0 = kbx0 >> 1;
 
 #pragma unroll
     for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
@@ -2008,14 +2025,21 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
             i = min(i, i_max);
         }
 
-        const block_q4_K * bxi = (const block_q4_K *) x + kbx0 + i*stride;
-        const int qs0 = get_int_b4(bxi->qs, txi);
+        const block_q4_K_mmvq2 * bxi = (const block_q4_K_mmvq2 *) x + tile_kbx0 + i*stride;
+
+        const int part = txi >> 4;
+        const int local = txi & 15;
+        const int g = local >> 2;
+        const int s = local & 3;
+        const int raw_txi = 8*g + 4*part + s;
+        const int lane_idx = k*16 + local;
+        const int qs0 = part == 0 ? bxi->qv0[lane_idx] : bxi->qv1[lane_idx];
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_qs[i*MMQ_MMA_TILE_X_K_Q8_1 + 16*(txi/8) + txi % 8 + 0] = (qs0 >> 0) & 0x0F0F0F0F;
-        x_qs[i*MMQ_MMA_TILE_X_K_Q8_1 + 16*(txi/8) + txi % 8 + 8] = (qs0 >> 4) & 0x0F0F0F0F;
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_1 + 16*(raw_txi/8) + raw_txi % 8 + 0] = (qs0 >> 0) & 0x0F0F0F0F;
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_1 + 16*(raw_txi/8) + raw_txi % 8 + 8] = (qs0 >> 4) & 0x0F0F0F0F;
 #else
-        x_qs[i*(MMQ_TILE_NE_K + 1) + txi] = qs0;
+        x_qs[i*(MMQ_TILE_NE_K + 1) + raw_txi] = qs0;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 
@@ -2037,23 +2061,21 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
                 i = min(i, i_max);
             }
 
-            const block_q4_K * bxi = (const block_q4_K *) x + kbx0 + i*stride;
-
-            const int * scales = (const int *) bxi->scales;
+            const block_q4_K_mmvq2 * bxi = (const block_q4_K_mmvq2 *) x + tile_kbx0 + i*stride;
             const int ksc = threadIdx.x % 2;
 
-            const int sc32 = unpack_scales_q45_K(scales, ksc + 0);
-            const int  m32 = unpack_scales_q45_K(scales, ksc + 2);
+            uint8_t aux0[4];
+            uint8_t aux1[4];
 
-            const uint8_t * sc8 = (const uint8_t *) &sc32;
-            const uint8_t *  m8 = (const uint8_t *)  &m32;
+            unpack_q4_K_sm6_mmvq2(bxi->sm6[k][2*ksc + 0], aux0);
+            unpack_q4_K_sm6_mmvq2(bxi->sm6[k][2*ksc + 1], aux1);
 
-            const half2 dm = bxi->dm * make_half2(1.0f, -1.0f);
+            const half2 dm = reinterpret_cast<const half2 *>(bxi->dm)[k] * make_half2(1.0f, -1.0f);
 
-    #pragma unroll
-            for (int l = 0; l < sizeof(int); ++l) {
-                x_dm[i*MMQ_MMA_TILE_X_K_Q8_1 + sizeof(int)*ksc + l] = dm*make_half2(sc8[l], m8[l]);
-            }
+            x_dm[i*MMQ_MMA_TILE_X_K_Q8_1 + 4*ksc + 0] = dm*make_half2(aux0[0], aux0[2]);
+            x_dm[i*MMQ_MMA_TILE_X_K_Q8_1 + 4*ksc + 1] = dm*make_half2(aux0[1], aux0[3]);
+            x_dm[i*MMQ_MMA_TILE_X_K_Q8_1 + 4*ksc + 2] = dm*make_half2(aux1[0], aux1[2]);
+            x_dm[i*MMQ_MMA_TILE_X_K_Q8_1 + 4*ksc + 3] = dm*make_half2(aux1[1], aux1[3]);
         }
     }
 #else
@@ -2065,9 +2087,9 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
             i = min(i, i_max);
         }
 
-        const block_q4_K * bxi = (const block_q4_K *) x + kbx0 + i*stride;
+        const block_q4_K_mmvq2 * bxi = (const block_q4_K_mmvq2 *) x + tile_kbx0 + i*stride;
 
-        x_dm[i] = bxi->dm;
+        x_dm[i] = reinterpret_cast<const half2 *>(bxi->dm)[k];
     }
     constexpr int rows_per_warp = warp_size / 4;
 #pragma unroll
@@ -2078,12 +2100,10 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
             i = min(i, i_max);
         }
 
-        const block_q4_K * bxi = (const block_q4_K *) x + kbx0 + i*stride + (threadIdx.x % (MMQ_TILE_NE_K/8)) / (QI4_K/8);
-
-        const int * scales = (const int *) bxi->scales;
+        const block_q4_K_mmvq2 * bxi = (const block_q4_K_mmvq2 *) x + tile_kbx0 + i*stride;
 
         const int ksc = threadIdx.x % (MMQ_TILE_NE_K/8);
-        const int scales8 = unpack_scales_q45_K(scales, ksc);
+        const int scales8 = pack_q4_K_mmvq2_scales8(bxi, k, ksc);
 
         x_sc[i*(MMQ_TILE_NE_K/8) + i/8 + ksc] = scales8;
     }
@@ -3400,7 +3420,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
-        load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+        const int kbx0 = type == GGML_TYPE_Q4_K ? 2*offset_x + kb0 : offset_x + kb0;
+        load_tiles(x, tile_x, kbx0, tile_x_max_i, stride_row_x);
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
