@@ -793,7 +793,9 @@ void ggml_cuda_mul_mat_vec_q(
     if (src0->type == GGML_TYPE_Q4_K) {
         // Prefer the persistent packed cache when available; keep the old temporary repack
         // as a fallback so non-cached tensors still work.
-        if (src0_extra && src0_extra->q4_k_mmvq2_device[ctx.device] != nullptr) {
+        if (src0->flags & GGML_TENSOR_FLAG_Q4_K_MMVQ2_PACKED) {
+            vx_mmvq = src0->data;
+        } else if (src0_extra && src0_extra->q4_k_mmvq2_device[ctx.device] != nullptr) {
             vx_mmvq = src0_extra->q4_k_mmvq2_device[ctx.device];
         } else {
             const size_t nbytes_src0_q4_k_mmvq2 = ne03 * ne02 * ne01 * tiles_per_row_x * sizeof(block_q4_K_mmvq2);
@@ -810,7 +812,9 @@ void ggml_cuda_mul_mat_vec_q(
 
         if (fusion && fusion->gate) {
             const ggml_tensor_extra_gpu * gate_extra = (const ggml_tensor_extra_gpu *) fusion->gate->extra;
-            if (gate_extra && gate_extra->q4_k_mmvq2_device[ctx.device] != nullptr) {
+            if (fusion->gate->flags & GGML_TENSOR_FLAG_Q4_K_MMVQ2_PACKED) {
+                fusion_local.gate = fusion->gate->data;
+            } else if (gate_extra && gate_extra->q4_k_mmvq2_device[ctx.device] != nullptr) {
                 fusion_local.gate = gate_extra->q4_k_mmvq2_device[ctx.device];
             } else {
                 const size_t nbytes_src0_q4_k_mmvq2 = ne03 * ne02 * ne01 * tiles_per_row_x * sizeof(block_q4_K_mmvq2);

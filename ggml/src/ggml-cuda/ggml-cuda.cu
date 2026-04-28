@@ -577,6 +577,7 @@ static size_t ggml_cuda_q4_k_mmvq2_nbytes(const ggml_tensor * tensor, const int6
 
 static bool ggml_cuda_should_cache_q4_k_mmvq2(const ggml_backend_buffer_t buffer, const ggml_tensor * tensor) {
     return tensor->type == GGML_TYPE_Q4_K &&
+           !(tensor->flags & GGML_TENSOR_FLAG_Q4_K_MMVQ2_PACKED) &&
            tensor->view_src == nullptr &&
            ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE;
 }

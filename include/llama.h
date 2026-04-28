@@ -389,6 +389,7 @@ extern "C" {
         bool only_copy;                       // only copy tensors - ftype, allow_requantize and quantize_output_tensor are ignored
         bool pure;                            // quantize all tensors to the default type
         bool keep_split;                      // quantize to the same number of shards
+        bool q4_k_mmvq2_packed;               // pack eligible Q4_K matmul tensors in CUDA MMVQ2 layout
         void * imatrix;                       // pointer to importance matrix data
         void * kv_overrides;                  // pointer to vector containing overrides
         void * tensor_types;                  // pointer to vector containing tensor types

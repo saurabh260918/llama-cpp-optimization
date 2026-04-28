@@ -635,6 +635,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_Q4_K_MMVQ2_PACKED = 32, // ...stores Q4_K data in the CUDA MMVQ2 packed layout
     };
 
     enum ggml_tri_type {

@@ -2,8 +2,11 @@
 
 #include "llama-impl.h"
 
+#include <cctype>
 #include <map>
 #include <set>
+#include <stdexcept>
+#include <vector>
 
 static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_CLIP,             "clip"             }, // dummy, only used by llama-quantize
@@ -2706,6 +2709,86 @@ llm_arch llm_arch_from_string(const std::string & name) {
 
 const llm_tensor_info & llm_tensor_info_for(llm_tensor tensor) {
     return LLM_TENSOR_INFOS.at(tensor);
+}
+
+static std::vector<int> llm_tensor_name_numbers(const std::string & name) {
+    std::vector<int> numbers;
+
+    for (size_t i = 0; i < name.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(name[i]))) {
+            continue;
+        }
+
+        int value = 0;
+        while (i < name.size() && std::isdigit(static_cast<unsigned char>(name[i]))) {
+            value = 10*value + (name[i] - '0');
+            ++i;
+        }
+        --i;
+
+        numbers.push_back(value);
+    }
+
+    return numbers;
+}
+
+bool llm_tensor_info_for_name(llm_arch arch, const std::string & name, llm_tensor_info & info, llm_tensor * tensor_out) {
+    const auto tn = LLM_TN(arch);
+    const std::set<llm_tensor> tensors = llm_get_tensor_names(arch);
+    const std::vector<int> numbers = llm_tensor_name_numbers(name);
+
+    std::vector<const char *> suffixes;
+    if (name.size() > 7 && name.compare(name.size() - 7, 7, ".weight") == 0) {
+        suffixes.push_back("weight");
+    } else if (name.size() > 5 && name.compare(name.size() - 5, 5, ".bias") == 0) {
+        suffixes.push_back("bias");
+    } else {
+        suffixes.push_back(nullptr);
+    }
+
+    for (llm_tensor tensor : tensors) {
+        llm_tensor_info candidate;
+        try {
+            candidate = llm_tensor_info_for(tensor);
+        } catch (const std::out_of_range &) {
+            continue;
+        }
+
+        for (const char * suffix : suffixes) {
+            if (candidate.layer == LLM_TENSOR_LAYER_INPUT || candidate.layer == LLM_TENSOR_LAYER_OUTPUT) {
+                if (name == tn(tensor, suffix)) {
+                    info = candidate;
+                    if (tensor_out) {
+                        *tensor_out = tensor;
+                    }
+                    return true;
+                }
+                continue;
+            }
+
+            if (numbers.empty()) {
+                continue;
+            }
+
+            if (name == tn(tensor, suffix, numbers[0])) {
+                info = candidate;
+                if (tensor_out) {
+                    *tensor_out = tensor;
+                }
+                return true;
+            }
+
+            if (numbers.size() >= 2 && name == tn(tensor, suffix, numbers[0], numbers[1])) {
+                info = candidate;
+                if (tensor_out) {
+                    *tensor_out = tensor;
+                }
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 
 bool llm_arch_is_recurrent(const llm_arch & arch) {

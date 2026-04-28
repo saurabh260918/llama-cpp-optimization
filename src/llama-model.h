@@ -484,6 +484,7 @@ struct llama_model {
 
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
+    bool q4_k_mmvq2_packed = false;
 
     // list of devices used in this model
     std::vector<ggml_backend_dev_t> devices;

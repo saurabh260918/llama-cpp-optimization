@@ -120,7 +120,9 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_pool_alloc<char> src0_q4_k_mmvq2(ctx.pool());
     if (src0->type == GGML_TYPE_Q4_K) {
         const ggml_tensor_extra_gpu * src0_extra = (const ggml_tensor_extra_gpu *) src0->extra;
-        if (src0_extra && src0_extra->q4_k_mmvq2_device[ctx.device] != nullptr) {
+        if (src0->flags & GGML_TENSOR_FLAG_Q4_K_MMVQ2_PACKED) {
+            src0_mmq = src0_d;
+        } else if (src0_extra && src0_extra->q4_k_mmvq2_device[ctx.device] != nullptr) {
             src0_mmq = (const char *) src0_extra->q4_k_mmvq2_device[ctx.device];
         } else {
             const int64_t blocks_per_row_x = ne00 / QK_K;
@@ -268,12 +270,16 @@ void ggml_cuda_op_mul_mat_q(
     if (src0->type == GGML_TYPE_Q4_K) {
         const int64_t blocks_per_row_x = ne00 / QK_K;
         const int64_t tiles_per_row_x = (blocks_per_row_x + 1) / 2;
-        const size_t nbytes_src0_q4_k_mmvq2 = row_diff * tiles_per_row_x * sizeof(block_q4_K_mmvq2);
-        src0_q4_k_mmvq2.alloc(ctx.pool(), nbytes_src0_q4_k_mmvq2);
-        repack_row_q4_K_mmvq2_cuda(
-            src0_dd_i, src0_q4_k_mmvq2.get(),
-            ne00, stride01_raw, row_diff * stride01_raw, row_diff * stride01_raw, row_diff, 1, 1, stream);
-        src0_mmq = src0_q4_k_mmvq2.get();
+        if (src0->flags & GGML_TENSOR_FLAG_Q4_K_MMVQ2_PACKED) {
+            src0_mmq = src0_dd_i;
+        } else {
+            const size_t nbytes_src0_q4_k_mmvq2 = row_diff * tiles_per_row_x * sizeof(block_q4_K_mmvq2);
+            src0_q4_k_mmvq2.alloc(ctx.pool(), nbytes_src0_q4_k_mmvq2);
+            repack_row_q4_K_mmvq2_cuda(
+                src0_dd_i, src0_q4_k_mmvq2.get(),
+                ne00, stride01_raw, row_diff * stride01_raw, row_diff * stride01_raw, row_diff, 1, 1, stream);
+            src0_mmq = src0_q4_k_mmvq2.get();
+        }
         stride01 = tiles_per_row_x;
     }
 

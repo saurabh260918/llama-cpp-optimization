@@ -3,6 +3,9 @@
 #include "llama-model.h"
 #include "llama-model-loader.h"
 
+#define GGML_COMMON_DECL_CPP
+#include "../ggml/src/ggml-common.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -18,6 +21,9 @@ struct tensor_quantization {
     std::string name;
     ggml_type quant = GGML_TYPE_COUNT;
 };
+
+static const char * const LLAMA_KV_Q4_K_LAYOUT = "quantize.q4_k.layout";
+static const char * const LLAMA_Q4_K_LAYOUT_MMVQ2_PACKED = "mmvq2_packed";
 
 static void zeros(std::ofstream & file, size_t n) {
     char zero = 0;
@@ -74,6 +80,112 @@ static std::string remap_imatrix (const std::string & orig_name, const std::map<
     }
 
     return orig_name;
+}
+
+struct alignas(32) llama_block_q4_K_mmvq2 {
+    int      qv0[32];
+    int      qv1[32];
+    uint8_t  sm6[2][4][3];
+    uint32_t dm[2];
+};
+
+static_assert(sizeof(llama_block_q4_K_mmvq2) == 2*sizeof(block_q4_K), "wrong llama_block_q4_K_mmvq2 size");
+
+static uint32_t llama_pack_q4_K_sm6_values(uint8_t sc0, uint8_t sc1, uint8_t m0, uint8_t m1) {
+    return ((uint32_t(sc0) & 0x3fu) <<  0)
+         | ((uint32_t(sc1) & 0x3fu) <<  6)
+         | ((uint32_t(m0)  & 0x3fu) << 12)
+         | ((uint32_t(m1)  & 0x3fu) << 18);
+}
+
+static uint32_t llama_pack_q4_K_sm6_group(const block_q4_K & src, const int g) {
+    const uint16_t * scales = reinterpret_cast<const uint16_t *>(src.scales);
+    uint16_t aux[2];
+
+    if (g < 2) {
+        aux[0] = scales[g + 0] & 0x3f3f;
+        aux[1] = scales[g + 2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[g + 2] >> 0) & 0x0f0f) | ((scales[g - 2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[g + 2] >> 4) & 0x0f0f) | ((scales[g - 0] & 0xc0c0) >> 2);
+    }
+
+    const uint8_t * sc = reinterpret_cast<const uint8_t *>(aux);
+    return llama_pack_q4_K_sm6_values(sc[0], sc[1], sc[2], sc[3]);
+}
+
+static size_t llama_q4_K_mmvq2_packed_size(const ggml_tensor * tensor) {
+    GGML_ASSERT(tensor->ne[0] % QK_K == 0);
+
+    const int64_t blocks_per_row = tensor->ne[0] / QK_K;
+    if (blocks_per_row % 2 != 0) {
+        throw std::runtime_error(format(
+            "Q4_K MMVQ2 packing requires an even number of Q4_K blocks per row for tensor %s (got %" PRId64 ")",
+            tensor->name, blocks_per_row));
+    }
+
+    const int64_t tiles_per_row = blocks_per_row / 2;
+    return tensor->ne[3] * tensor->ne[2] * tensor->ne[1] * tiles_per_row * sizeof(llama_block_q4_K_mmvq2);
+}
+
+static size_t llama_pack_q4_K_mmvq2_tensor(const ggml_tensor * tensor, const void * src_data, void * dst_data) {
+    const int64_t blocks_per_row = tensor->ne[0] / QK_K;
+    const int64_t tiles_per_row  = blocks_per_row / 2;
+    const size_t nbytes_packed   = llama_q4_K_mmvq2_packed_size(tensor);
+
+    const block_q4_K * vx = reinterpret_cast<const block_q4_K *>(src_data);
+    llama_block_q4_K_mmvq2 * vy = reinterpret_cast<llama_block_q4_K_mmvq2 *>(dst_data);
+
+    for (int64_t i3 = 0; i3 < tensor->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < tensor->ne[2]; ++i2) {
+            for (int64_t i1 = 0; i1 < tensor->ne[1]; ++i1) {
+                const int64_t src_block0 = ((i3 * tensor->ne[2] + i2) * tensor->ne[1] + i1) * blocks_per_row;
+                const int64_t dst_tile0  = ((i3 * tensor->ne[2] + i2) * tensor->ne[1] + i1) * tiles_per_row;
+
+                for (int64_t tile = 0; tile < tiles_per_row; ++tile) {
+                    llama_block_q4_K_mmvq2 & dst = vy[dst_tile0 + tile];
+                    const int64_t src_block0_tile = src_block0 + 2*tile;
+
+                    for (int lane = 0; lane < 32; ++lane) {
+                        const int k = lane >> 4;
+                        const int g = (lane & 15) >> 2;
+                        const int s = lane & 3;
+                        const block_q4_K & src = vx[src_block0_tile + k];
+                        const int * q4 = reinterpret_cast<const int *>(src.qs + 32*g + 4*s);
+                        dst.qv0[lane] = q4[0];
+                        dst.qv1[lane] = q4[4];
+                    }
+
+                    for (int k = 0; k < 2; ++k) {
+                        const block_q4_K & src = vx[src_block0_tile + k];
+                        for (int g = 0; g < 4; ++g) {
+                            const uint32_t packed = llama_pack_q4_K_sm6_group(src, g);
+                            dst.sm6[k][g][0] = packed & 0xff;
+                            dst.sm6[k][g][1] = (packed >> 8) & 0xff;
+                            dst.sm6[k][g][2] = (packed >> 16) & 0xff;
+                        }
+                        std::memcpy(&dst.dm[k], &src, sizeof(dst.dm[k]));
+                    }
+                }
+            }
+        }
+    }
+
+    return nbytes_packed;
+}
+
+static bool llama_should_pack_q4_K_mmvq2(llm_arch arch, const std::string & name, ggml_type type) {
+    if (type != GGML_TYPE_Q4_K) {
+        return false;
+    }
+
+    llm_tensor_info info;
+    if (!llm_tensor_info_for_name(arch, name, info)) {
+        LLAMA_LOG_WARN("%s: cannot resolve op for Q4_K tensor %s; leaving raw\n", __func__, name.c_str());
+        return false;
+    }
+
+    return info.op == GGML_OP_MUL_MAT || info.op == GGML_OP_MUL_MAT_ID;
 }
 
 struct quantize_state_impl {
@@ -589,6 +701,25 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     gguf_set_val_u32(ctx_out.get(), "general.quantization_version", GGML_QNT_VERSION); // TODO: use LLM_KV
     gguf_set_val_u32(ctx_out.get(), "general.file_type", ftype); // TODO: use LLM_KV
 
+    bool input_q4_k_mmvq2_packed = false;
+    if (const int key = gguf_find_key(ml.meta.get(), LLAMA_KV_Q4_K_LAYOUT); key >= 0) {
+        if (gguf_get_kv_type(ml.meta.get(), key) == GGUF_TYPE_STRING) {
+            input_q4_k_mmvq2_packed = strcmp(gguf_get_val_str(ml.meta.get(), key), LLAMA_Q4_K_LAYOUT_MMVQ2_PACKED) == 0;
+        }
+    }
+
+    if (input_q4_k_mmvq2_packed && params->q4_k_mmvq2_packed) {
+        throw std::runtime_error("input model already has Q4_K MMVQ2 packed tensors; refusing to pack it again");
+    }
+    if (input_q4_k_mmvq2_packed && !params->only_copy) {
+        throw std::runtime_error("input model has Q4_K MMVQ2 packed tensors; only COPY is supported for this layout");
+    }
+    if (params->q4_k_mmvq2_packed) {
+        gguf_set_val_str(ctx_out.get(), LLAMA_KV_Q4_K_LAYOUT, LLAMA_Q4_K_LAYOUT_MMVQ2_PACKED);
+    } else if (!input_q4_k_mmvq2_packed) {
+        gguf_remove_key(ctx_out.get(), LLAMA_KV_Q4_K_LAYOUT);
+    }
+
     // Remove split metadata
     gguf_remove_key(ctx_out.get(), ml.llm_kv(LLM_KV_SPLIT_NO).c_str());
     gguf_remove_key(ctx_out.get(), ml.llm_kv(LLM_KV_SPLIT_COUNT).c_str());
@@ -646,6 +777,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         });
     }
 
+    const auto tn = LLM_TN(model.arch);
+    const auto token_embd_name = std::string(tn(LLM_TENSOR_TOKEN_EMBD, "weight"));
+    const auto output_name     = std::string(tn(LLM_TENSOR_OUTPUT,     "weight"));
+
+    const llama_model_loader::llama_tensor_weight * token_embd_weight = nullptr;
+
     for (const auto * it : tensors) {
         const struct ggml_tensor * tensor = it->tensor;
 
@@ -656,8 +793,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             name.find("attn_qkv.weight") != std::string::npos ||
             name.find("attn_kv_b.weight")!= std::string::npos) {
             ++qs.n_attention_wv;
-        } else if (name == LLM_TN(model.arch)(LLM_TENSOR_OUTPUT, "weight")) {
+        } else if (name == output_name) {
             qs.has_output = true;
+        }
+
+        if (name == token_embd_name) {
+            token_embd_weight = it;
         }
     }
 
@@ -673,6 +814,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     std::vector<no_init<uint8_t>> read_data;
     std::vector<no_init<uint8_t>> work;
+    std::vector<no_init<uint8_t>> pack_data;
     std::vector<no_init<float>> f32_conv_buf;
 
     uint16_t n_split = 1;
@@ -686,6 +828,26 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     std::vector<gguf_context_ptr> ctx_outs(n_split);
     ctx_outs[0] = std::move(ctx_out);
 
+    struct tied_output_mmvq2_state {
+        bool enabled = false;
+        bool ready   = false;
+        bool written = false;
+        uint16_t split = 0;
+        ggml_tensor meta = {};
+        std::vector<no_init<uint8_t>> data;
+    } tied_output;
+
+    if (params->q4_k_mmvq2_packed && params->only_copy && !qs.has_output && token_embd_weight && token_embd_weight->tensor->type == GGML_TYPE_Q4_K) {
+        tied_output.enabled = true;
+        tied_output.split = params->keep_split ? token_embd_weight->idx : 0;
+        tied_output.meta = *token_embd_weight->tensor;
+        ggml_set_name(&tied_output.meta, output_name.c_str());
+        llama_q4_K_mmvq2_packed_size(&tied_output.meta); // validate row layout before writing metadata
+
+        LLAMA_LOG_INFO("%s: tied Q4_K token embeddings detected; keeping %s raw and materializing packed %s\n",
+                __func__, token_embd_name.c_str(), output_name.c_str());
+    }
+
     // populate the original tensors so we get an initial meta data
     for (const auto * it : tensors) {
         uint16_t i_split = params->keep_split ? it->idx : 0;
@@ -695,21 +857,56 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
         gguf_add_tensor(ctx_outs[i_split].get(), tensor);
     }
+    if (tied_output.enabled) {
+        if (!ctx_outs[tied_output.split]) {
+            ctx_outs[tied_output.split].reset(gguf_init_empty());
+        }
+        gguf_add_tensor(ctx_outs[tied_output.split].get(), &tied_output.meta);
+    }
 
     // Set split info if needed
     if (n_split > 1) {
         for (size_t i = 0; i < ctx_outs.size(); ++i) {
             gguf_set_val_u16(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_NO).c_str(), i);
             gguf_set_val_u16(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_COUNT).c_str(), n_split);
-            gguf_set_val_i32(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_TENSORS_COUNT).c_str(), (int32_t)tensors.size());
+            gguf_set_val_i32(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_TENSORS_COUNT).c_str(),
+                    (int32_t)tensors.size() + (tied_output.enabled ? 1 : 0));
         }
     }
 
     int cur_split = -1;
     std::ofstream fout;
+    auto write_tied_output_if_needed = [&](int split) {
+        if (!tied_output.enabled || tied_output.written || tied_output.split != split) {
+            return;
+        }
+        if (!tied_output.ready) {
+            throw std::runtime_error(format("packed tied output tensor %s was not prepared", output_name.c_str()));
+        }
+
+        const size_t new_size = tied_output.data.size();
+
+        LLAMA_LOG_INFO("[%4d/%4d] %36s - [%s], type = %6s, materialized tied output, size = %8.3f MiB\n",
+               ++idx, ml.n_tensors,
+               output_name.c_str(),
+               llama_format_tensor_shape(&tied_output.meta).c_str(),
+               ggml_type_name(tied_output.meta.type),
+               new_size/1024.0/1024.0);
+
+        gguf_set_tensor_type(ctx_outs[split].get(), output_name.c_str(), GGML_TYPE_Q4_K);
+        GGML_ASSERT(gguf_get_tensor_size(ctx_outs[split].get(), gguf_find_tensor(ctx_outs[split].get(), output_name.c_str())) == new_size);
+        gguf_set_tensor_data(ctx_outs[split].get(), output_name.c_str(), tied_output.data.data());
+
+        fout.write((const char *) tied_output.data.data(), new_size);
+        zeros(fout, GGML_PAD(new_size, align) - new_size);
+
+        total_size_new += new_size;
+        tied_output.written = true;
+    };
     auto close_ofstream = [&]() {
         // Write metadata and close file handler
         if (fout.is_open()) {
+            write_tied_output_if_needed(cur_split);
             fout.seekp(0);
             std::vector<uint8_t> data(gguf_get_meta_size(ctx_outs[cur_split].get()));
             gguf_get_meta_data(ctx_outs[cur_split].get(), data.data());
@@ -734,7 +931,6 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         ::zeros(fout, meta_size);
     };
 
-    const auto tn = LLM_TN(model.arch);
     new_ofstream(0);
     for (const auto * it : tensors) {
         const auto & weight = *it;
@@ -769,7 +965,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         // do not quantize norm tensors
         quantize &= name.find("_norm.weight") == std::string::npos;
 
-        quantize &= params->quantize_output_tensor || name != "output.weight";
+        quantize &= params->quantize_output_tensor || name != output_name;
         quantize &= !params->only_copy;
 
         // do not quantize expert gating tensors
@@ -888,10 +1084,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     }
                 }
             }
-            if (params->token_embedding_type < GGML_TYPE_COUNT && strcmp(tensor->name, "token_embd.weight") == 0) {
+            if (params->token_embedding_type < GGML_TYPE_COUNT && name == token_embd_name) {
                 new_type = params->token_embedding_type;
             }
-            if (params->output_tensor_type < GGML_TYPE_COUNT && strcmp(tensor->name, "output.weight") == 0) {
+            if (params->output_tensor_type < GGML_TYPE_COUNT && name == output_name) {
                 new_type = params->output_tensor_type;
             }
 
@@ -904,7 +1100,25 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             new_type = tensor->type;
             new_data = tensor->data;
             new_size = ggml_nbytes(tensor);
-            LLAMA_LOG_INFO("size = %8.3f MiB\n", ggml_nbytes(tensor)/1024.0/1024.0);
+
+            if (params->q4_k_mmvq2_packed && llama_should_pack_q4_K_mmvq2(model.arch, name, new_type)) {
+                const size_t packed_size = llama_q4_K_mmvq2_packed_size(tensor);
+                if (pack_data.size() < packed_size) {
+                    pack_data.resize(packed_size);
+                }
+                LLAMA_LOG_INFO("packing Q4_K for MMVQ2 .. ");
+                new_size = llama_pack_q4_K_mmvq2_tensor(tensor, new_data, pack_data.data());
+                new_data = pack_data.data();
+            }
+
+            if (tied_output.enabled && name == token_embd_name) {
+                const size_t packed_size = llama_q4_K_mmvq2_packed_size(tensor);
+                tied_output.data.resize(packed_size);
+                llama_pack_q4_K_mmvq2_tensor(tensor, tensor->data, tied_output.data.data());
+                tied_output.ready = true;
+            }
+
+            LLAMA_LOG_INFO("size = %8.3f MiB\n", new_size/1024.0/1024.0);
         } else {
             const int64_t nelements = ggml_nelements(tensor);
 
@@ -1005,6 +1219,15 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 }
 #endif
             }
+            if (params->q4_k_mmvq2_packed && llama_should_pack_q4_K_mmvq2(model.arch, name, new_type)) {
+                const size_t packed_size = llama_q4_K_mmvq2_packed_size(tensor);
+                if (pack_data.size() < packed_size) {
+                    pack_data.resize(packed_size);
+                }
+                LLAMA_LOG_INFO("packing Q4_K for MMVQ2 .. ");
+                new_size = llama_pack_q4_K_mmvq2_tensor(tensor, new_data, pack_data.data());
+                new_data = pack_data.data();
+            }
             LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", ggml_nbytes(tensor)/1024.0/1024.0, new_size/1024.0/1024.0);
         }
         total_size_org += ggml_nbytes(tensor);
@@ -1045,6 +1268,7 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.only_copy                   =*/ false,
         /*.pure                        =*/ false,
         /*.keep_split                  =*/ false,
+        /*.q4_k_mmvq2_packed           =*/ false,
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,

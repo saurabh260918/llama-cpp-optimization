@@ -118,7 +118,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 
 [[noreturn]]
 static void usage(const char * executable) {
-    printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
+    printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--pack-q4-k-mmvq2] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
     printf("       [--prune-layers] [--keep-split] [--override-kv]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
@@ -131,6 +131,9 @@ static void usage(const char * executable) {
     printf("                                      increases model size but may also increase quality, especially when requantizing\n");
     printf("  --pure\n");
     printf("                                      disable k-quant mixtures and quantize all tensors to the same type\n");
+    printf("  --pack-q4-k-mmvq2\n");
+    printf("                                      pack eligible Q4_K MUL_MAT/MUL_MAT_ID tensors in CUDA MMVQ2 layout\n");
+    printf("                                      use with COPY to repack an already-quantized GGUF without requantizing\n");
     printf("  --imatrix file_name\n");
     printf("                                      use data in file_name as importance matrix for quant optimizations\n");
     printf("  --include-weights tensor_name\n");
@@ -536,6 +539,8 @@ int main(int argc, char ** argv) {
             params.allow_requantize = true;
         } else if (strcmp(argv[arg_idx], "--pure") == 0) {
             params.pure = true;
+        } else if (strcmp(argv[arg_idx], "--pack-q4-k-mmvq2") == 0) {
+            params.q4_k_mmvq2_packed = true;
         } else if (strcmp(argv[arg_idx], "--imatrix") == 0) {
             if (arg_idx < argc-1) {
                 imatrix_file = argv[++arg_idx];
@@ -730,4 +735,3 @@ int main(int argc, char ** argv) {
 
     return 0;
 }
-

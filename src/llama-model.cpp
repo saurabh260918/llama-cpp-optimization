@@ -26,6 +26,9 @@
 #include <sstream>
 #include <stdexcept>
 
+static const char * const LLAMA_KV_Q4_K_LAYOUT = "quantize.q4_k.layout";
+static const char * const LLAMA_Q4_K_LAYOUT_MMVQ2_PACKED = "mmvq2_packed";
+
 const char * llm_type_name(llm_type type) {
     switch (type) {
         case LLM_TYPE_14M:           return "14M";
@@ -325,6 +328,24 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
+static bool is_q4_k_mmvq2_supported_buft(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (!dev) {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
+    if (!dev) {
+        return false;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg) {
+        return false;
+    }
+
+    const char * reg_name = ggml_backend_reg_name(reg);
+    return strcmp(reg_name, "CUDA") == 0 || strcmp(reg_name, "ROCm") == 0 || strcmp(reg_name, "MUSA") == 0;
+}
+
 // CPU: ACCEL -> GPU host -> CPU extra -> CPU
 static buft_list_t make_cpu_buft_list(const std::vector<ggml_backend_dev_t> & devices, bool use_extra_bufts, bool no_host) {
     buft_list_t buft_list;
@@ -501,6 +522,12 @@ void llama_model::load_hparams(llama_model_loader & ml) {
         const char * name = gguf_get_key(ctx, i);
         const std::string value = gguf_kv_to_str(ctx, i);
         gguf_kv.emplace(name, value);
+    }
+
+    if (const int key = gguf_find_key(ctx, LLAMA_KV_Q4_K_LAYOUT); key >= 0) {
+        if (gguf_get_kv_type(ctx, key) == GGUF_TYPE_STRING) {
+            q4_k_mmvq2_packed = strcmp(gguf_get_val_str(ctx, key), LLAMA_Q4_K_LAYOUT_MMVQ2_PACKED) == 0;
+        }
     }
 
     // get general kv
@@ -2756,6 +2783,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 op = info.op;
             }
 
+            const bool q4_k_mmvq2_tensor =
+                q4_k_mmvq2_packed &&
+                t_meta->type == GGML_TYPE_Q4_K &&
+                !bias &&
+                (info.op == GGML_OP_MUL_MAT || info.op == GGML_OP_MUL_MAT_ID);
+
             // sanity checks
             if (info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT) {
                 if (tn.bid != -1) {
@@ -2824,6 +2857,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 buft = ggml_backend_dev_buffer_type(cpu_dev);
             }
 
+            if (q4_k_mmvq2_tensor && !is_q4_k_mmvq2_supported_buft(buft)) {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                if (!dev) {
+                    dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                }
+                throw std::runtime_error(format(
+                    "tensor %s is Q4_K MMVQ2-packed but selected buffer type %s on %s does not support this layout",
+                    tn.str().c_str(), ggml_backend_buft_name(buft), dev ? ggml_backend_dev_name(dev) : "unknown device"));
+            }
+
             if (buft != buft_list->front().second) {
                 n_moved_tensors++;
                 if (!first_moved_tensor) {
@@ -2835,6 +2878,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
             ggml_context * ctx = ctx_for_buft(buft);
 
+            if ((flags & TENSOR_DUPLICATED) && q4_k_mmvq2_tensor) {
+                throw std::runtime_error(format(
+                    "packed tied output tensor %s must be materialized as a separate %s tensor",
+                    tn.str().c_str(), std::string(LLM_TN(arch)(LLM_TENSOR_OUTPUT, "weight")).c_str()));
+            }
+
             // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
             if (flags & TENSOR_DUPLICATED) {
                 ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
@@ -2842,7 +2891,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     return t;
                 }
             }
-            return ml.create_tensor(ctx, tn, ne, flags);
+
+            ggml_tensor * t = ml.create_tensor(ctx, tn, ne, flags);
+            if (q4_k_mmvq2_tensor) {
+                t->flags |= GGML_TENSOR_FLAG_Q4_K_MMVQ2_PACKED;
+            }
+            return t;
         };
 
         layers.resize(n_layer);
