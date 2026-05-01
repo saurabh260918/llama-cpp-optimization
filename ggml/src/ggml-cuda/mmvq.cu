@@ -403,6 +403,195 @@ static __global__ void mul_mat_vec_q(
     }
 }
 
+template <int n_tokens>
+__launch_bounds__(calc_nwarps(n_tokens, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q4_k_mmvq2_moe_grouped(
+        const block_q4_K_mmvq2 * __restrict__ vx, const block_q8_1_mmvq2 * __restrict__ vy,
+        const int32_t * __restrict__ ids, float * __restrict__ dst,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint32_t n_expert_used,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t nchannels_y, const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t ids_stride) {
+
+    constexpr int qk  = ggml_cuda_type_traits<GGML_TYPE_Q4_K>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<GGML_TYPE_Q4_K>::qi;
+    constexpr int vdr = get_vdr_mmvq(GGML_TYPE_Q4_K);
+    constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+    constexpr int nwarps = calc_nwarps(n_tokens, table_id);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(n_tokens, table_id);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    const int tid = warp_size*threadIdx.y + threadIdx.x;
+    const int row0 = rows_per_cuda_block*blockIdx.x;
+    const uint32_t expert = blockIdx.y;
+    const int blocks_per_row_x = ncols_x / qk;
+    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+
+    bool active[n_tokens];
+    uint32_t channel_y[n_tokens];
+    uint32_t channel_dst[n_tokens];
+    const block_q8_1_mmvq2 * y[n_tokens];
+    bool any_active = false;
+
+#pragma unroll
+    for (int token = 0; token < n_tokens; ++token) {
+        active[token] = false;
+        channel_y[token] = 0;
+        channel_dst[token] = 0;
+        y[token] = nullptr;
+
+        for (uint32_t expert_slot = 0; expert_slot < n_expert_used; ++expert_slot) {
+            if ((uint32_t) ids[expert_slot + token*ids_stride] == expert) {
+                active[token] = true;
+                channel_dst[token] = expert_slot;
+                channel_y[token] = expert_slot % nchannels_y;
+                y[token] = vy + token*stride_col_y + channel_y[token]*stride_channel_y;
+                any_active = true;
+                break;
+            }
+        }
+    }
+
+    if (!any_active) {
+        return;
+    }
+
+    const block_q4_K_mmvq2 * x = vx + expert*stride_channel_x;
+
+    float tmp[n_tokens][rows_per_cuda_block] = {{0.0f}};
+
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kqs = vdr * (tid % (qi/vdr));
+
+#pragma unroll
+        for (int token = 0; token < n_tokens; ++token) {
+            if (!active[token]) {
+                continue;
+            }
+#pragma unroll
+            for (int row = 0; row < rows_per_cuda_block; ++row) {
+                if ((uint32_t) (row0 + row) < nrows_x) {
+                    tmp[token][row] += vec_dot_q4_K_mmvq2_q8_1_mmvq2(
+                        &x[(row0 + row)*stride_row_x], y[token], kbx, kqs);
+                }
+            }
+        }
+    }
+
+    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][n_tokens][rows_per_cuda_block][warp_size];
+
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int token = 0; token < n_tokens; ++token) {
+#pragma unroll
+            for (int row = 0; row < rows_per_cuda_block; ++row) {
+                tmp_shared[threadIdx.y-1][token][row][threadIdx.x] = tmp[token][row];
+            }
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.y > 0) {
+        return;
+    }
+
+#pragma unroll
+    for (int token = 0; token < n_tokens; ++token) {
+        if (!active[token]) {
+            continue;
+        }
+#pragma unroll
+        for (int row = 0; row < rows_per_cuda_block; ++row) {
+#pragma unroll
+            for (int l = 0; l < nwarps-1; ++l) {
+                tmp[token][row] += tmp_shared[l][token][row][threadIdx.x];
+            }
+
+            tmp[token][row] = warp_reduce_sum<warp_size>(tmp[token][row]);
+
+            if (threadIdx.x == (uint32_t) row && (uint32_t) (row0 + row) < nrows_x) {
+                dst[token*stride_col_dst + channel_dst[token]*stride_channel_dst + row0 + row] = tmp[token][row];
+            }
+        }
+    }
+}
+
+template <int n_tokens>
+static void mul_mat_vec_q4_k_mmvq2_moe_grouped_launch(
+        const void * vx, const void * vy, const int32_t * ids, float * dst,
+        const int ncols_x, const int nrows_x, const int n_expert_used,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst,
+        const int nchannels_x, const int nchannels_y,
+        const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const int ids_stride, cudaStream_t stream) {
+
+    const int device = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const mmvq_parameter_table_id table_id = get_device_table_id(ggml_cuda_info().devices[device].cc);
+    const int64_t nblocks = (nrows_x + calc_rows_per_block(n_tokens, table_id) - 1) / calc_rows_per_block(n_tokens, table_id);
+
+    const dim3 block_nums(nblocks, nchannels_x, 1);
+    const dim3 block_dims(warp_size, calc_nwarps(n_tokens, table_id), 1);
+
+    mul_mat_vec_q4_k_mmvq2_moe_grouped<n_tokens><<<block_nums, block_dims, 0, stream>>>(
+        (const block_q4_K_mmvq2 *) vx, (const block_q8_1_mmvq2 *) vy, ids, dst,
+        ncols_x, nrows_x, n_expert_used,
+        stride_row_x, stride_col_y, stride_col_dst,
+        nchannels_y, stride_channel_x, stride_channel_y, stride_channel_dst,
+        ids_stride);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static bool mul_mat_vec_q4_k_mmvq2_moe_grouped_switch(
+        const void * vx, const void * vy, const int32_t * ids, float * dst,
+        const int ncols_x, const int nrows_x, const int n_tokens, const int n_expert_used,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst,
+        const int nchannels_x, const int nchannels_y,
+        const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const int ids_stride, cudaStream_t stream) {
+
+    switch (n_tokens) {
+        case 2:
+            mul_mat_vec_q4_k_mmvq2_moe_grouped_launch<2>(
+                vx, vy, ids, dst, ncols_x, nrows_x, n_expert_used, stride_row_x, stride_col_y, stride_col_dst,
+                nchannels_x, nchannels_y, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            return true;
+        case 3:
+            mul_mat_vec_q4_k_mmvq2_moe_grouped_launch<3>(
+                vx, vy, ids, dst, ncols_x, nrows_x, n_expert_used, stride_row_x, stride_col_y, stride_col_dst,
+                nchannels_x, nchannels_y, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            return true;
+        case 4:
+            mul_mat_vec_q4_k_mmvq2_moe_grouped_launch<4>(
+                vx, vy, ids, dst, ncols_x, nrows_x, n_expert_used, stride_row_x, stride_col_y, stride_col_dst,
+                nchannels_x, nchannels_y, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            return true;
+        case 5:
+            mul_mat_vec_q4_k_mmvq2_moe_grouped_launch<5>(
+                vx, vy, ids, dst, ncols_x, nrows_x, n_expert_used, stride_row_x, stride_col_y, stride_col_dst,
+                nchannels_x, nchannels_y, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            return true;
+        case 6:
+            mul_mat_vec_q4_k_mmvq2_moe_grouped_launch<6>(
+                vx, vy, ids, dst, ncols_x, nrows_x, n_expert_used, stride_row_x, stride_col_y, stride_col_dst,
+                nchannels_x, nchannels_y, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            return true;
+        case 7:
+            mul_mat_vec_q4_k_mmvq2_moe_grouped_launch<7>(
+                vx, vy, ids, dst, ncols_x, nrows_x, n_expert_used, stride_row_x, stride_col_y, stride_col_dst,
+                nchannels_x, nchannels_y, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            return true;
+        case 8:
+            mul_mat_vec_q4_k_mmvq2_moe_grouped_launch<8>(
+                vx, vy, ids, dst, ncols_x, nrows_x, n_expert_used, stride_row_x, stride_col_y, stride_col_dst,
+                nchannels_x, nchannels_y, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            return true;
+        default:
+            return false;
+    }
+}
+
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id) {
@@ -848,6 +1037,29 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    static const bool use_grouped_q4_k_mmvq2 = getenv("GGML_CUDA_MUL_MAT_ID_GROUPED_Q4_K_MMVQ2") != nullptr ||
+        getenv("GGML_CUDA_MUL_MAT_ID_BUCKETED_Q4_K_MMVQ2") != nullptr;
+    static constexpr int64_t grouped_max_output_rows = 4096;
+    const bool can_use_grouped_q4_k_mmvq2 =
+        use_grouped_q4_k_mmvq2 &&
+        ids &&
+        !fusion &&
+        src0->type == GGML_TYPE_Q4_K &&
+        (src0->flags & GGML_TENSOR_FLAG_Q4_K_MMVQ2_PACKED) &&
+        ne03 == 1 &&
+        ne3  == 1 &&
+        ncols_dst > 1 &&
+        ncols_dst <= MMVQ_MAX_BATCH_SIZE &&
+        ne01 <= grouped_max_output_rows;
+
+    if (can_use_grouped_q4_k_mmvq2 && mul_mat_vec_q4_k_mmvq2_moe_grouped_switch(
+            vx_mmvq, src1_q8_1.get(), ids_d, dst_d, ne00, ne01, ncols_dst, nchannels_dst,
+            s01, stride_col_y, stride_col_dst,
+            ne02, nchannels_y, s02, stride_channel_y, stride_channel_dst,
+            ids_stride, stream)) {
+        return;
+    }
 
     mul_mat_vec_q_switch_type(
         vx_mmvq, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,

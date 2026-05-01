@@ -2339,6 +2339,27 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 }
 
+static bool ggml_cuda_should_use_mul_mat_id_grouped_q4_k_mmvq2(
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
+    static const bool enabled = getenv("GGML_CUDA_MUL_MAT_ID_GROUPED_Q4_K_MMVQ2") != nullptr ||
+        getenv("GGML_CUDA_MUL_MAT_ID_BUCKETED_Q4_K_MMVQ2") != nullptr;
+    static constexpr int64_t grouped_max_output_rows = 4096;
+
+    return enabled &&
+        ids != nullptr &&
+        src0->type == GGML_TYPE_Q4_K &&
+        (src0->flags & GGML_TENSOR_FLAG_Q4_K_MMVQ2_PACKED) &&
+        src1->type == GGML_TYPE_F32 &&
+        dst->type  == GGML_TYPE_F32 &&
+        src0->ne[3] == 1 &&
+        src1->ne[3] == 1 &&
+        dst->ne[3]  == 1 &&
+        src1->ne[2] == dst->ne[2] &&
+        dst->ne[2] > 1 &&
+        dst->ne[2] <= MMVQ_MAX_BATCH_SIZE &&
+        src0->ne[1] <= grouped_max_output_rows;
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2351,6 +2372,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool use_grouped_q4_k_mmvq2 = ggml_cuda_should_use_mul_mat_id_grouped_q4_k_mmvq2(src0, src1, ids, dst);
+
+    if (use_grouped_q4_k_mmvq2) {
+        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+        return;
+    }
 
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
